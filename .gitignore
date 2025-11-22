@@ -1,0 +1,11 @@
+__pycache__/
+*/__pycache__/
+.pytest_cache/
+.DS_Store
+
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+models/
+

@@ -1,0 +1,9 @@
+# requirements for vla-oft
+torch>=2.0.0
+transformers>=4.30.0
+pillow>=9.5.0
+pytest>=7.4.0
+numpy>=1.23.0
+
+# Optional: uncomment if using flash attention
+# flash-attn>=2.0.0

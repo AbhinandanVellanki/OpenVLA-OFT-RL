@@ -22,54 +22,6 @@ from collections import defaultdict
 import random
 
 
-@dataclass
-class RolloutBuffer:
-    """Simple buffer for storing rollout data."""
-    observations: List[np.ndarray]
-    actions: List[np.ndarray]
-    rewards: List[float]
-    dones: List[bool]
-    values: List[float]
-    log_probs: List[float]
-    
-    def __init__(self):
-        self.clear()
-    
-    def clear(self):
-        self.observations = []
-        self.actions = []
-        self.rewards = []
-        self.dones = []
-        self.values = []
-        self.log_probs = []
-    
-    def add(
-        self,
-        obs: np.ndarray,
-        action: np.ndarray,
-        reward: float,
-        done: bool,
-        value: float,
-        log_prob: float,
-    ):
-        self.observations.append(obs)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.dones.append(done)
-        self.values.append(value)
-        self.log_probs.append(log_prob)
-    
-    def get(self) -> Dict[str, np.ndarray]:
-        return {
-            "observations": np.array(self.observations),
-            "actions": np.array(self.actions),
-            "rewards": np.array(self.rewards),
-            "dones": np.array(self.dones),
-            "values": np.array(self.values),
-            "log_probs": np.array(self.log_probs),
-        }
-
-
 class PPOTrainer:
     """
     PPO Trainer for LIBERO environments.
@@ -199,8 +151,7 @@ class PPOTrainer:
         # Multiple epochs of optimization
         for epoch in range(n_epochs):
             # Generate random minibatch indices
-            indices = np.arange(len(observations))
-            np.random.shuffle(indices)
+            indices = torch.randperm(len(observations))
             
             # Process minibatches
             for start_idx in range(0, len(observations), batch_size):
@@ -488,12 +439,20 @@ def train_ppo(
     # Create dummy actor and critic for PPOTrainer
     # In real usage, replace with actual VLA actor and critic networks
     class DummyActor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dummy_param = nn.Parameter(torch.zeros(1))
+        
         def forward(self, x):
-            return x
+            return x + self.dummy_param * 0  # Use param so it's not optimized away
     
     class DummyCritic(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dummy_param = nn.Parameter(torch.zeros(1))
+        
         def forward(self, x):
-            return torch.zeros(x.shape[0], 1)
+            return torch.zeros(x.shape[0], 1) + self.dummy_param * 0
     
     # Initialize PPO trainer
     trainer = PPOTrainer(

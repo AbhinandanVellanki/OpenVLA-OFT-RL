@@ -17,9 +17,10 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
 from collections import defaultdict
-import random
+
+from rollout_buffer import RolloutBuffer
+from dummy_policy import DummyPolicy
 
 
 class PPOTrainer:
@@ -201,106 +202,6 @@ class PPOTrainer:
         
         # Return mean statistics
         return {k: np.mean(v) for k, v in stats.items()}
-
-
-class DummyPolicy:
-    """Dummy policy for demonstration (replace with actual VLA policy)."""
-    
-    def __init__(self, action_dim: int = 7):
-        self.action_dim = action_dim
-    
-    def get_action(self, obs: np.ndarray) -> Tuple[np.ndarray, float, float]:
-        """Get action, value, and log_prob (dummy implementation)."""
-        action = np.random.uniform(-1, 1, self.action_dim).astype(np.float32)
-        value = 0.0  # Dummy value
-        log_prob = 0.0  # Dummy log prob
-        return action, value, log_prob
-    
-    def get_value(self, obs: np.ndarray) -> float:
-        """Get value estimate (dummy implementation)."""
-        return 0.0
-
-
-@dataclass
-class RolloutBuffer:
-    """Buffer for storing rollout data with computed advantages."""
-    observations: List[np.ndarray]
-    actions: List[np.ndarray]
-    rewards: List[float]
-    dones: List[bool]
-    values: List[float]
-    log_probs: List[float]
-    advantages: Optional[np.ndarray] = None
-    returns: Optional[np.ndarray] = None
-    
-    def __init__(self):
-        self.clear()
-    
-    def clear(self):
-        self.observations = []
-        self.actions = []
-        self.rewards = []
-        self.dones = []
-        self.values = []
-        self.log_probs = []
-        self.advantages = None
-        self.returns = None
-    
-    def add(
-        self,
-        obs: np.ndarray,
-        action: np.ndarray,
-        reward: float,
-        done: bool,
-        value: float,
-        log_prob: float,
-    ):
-        self.observations.append(obs)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.dones.append(done)
-        self.values.append(value)
-        self.log_probs.append(log_prob)
-    
-    def compute_returns_and_advantages(
-        self,
-        last_value: float,
-        gamma: float = 0.99,
-        gae_lambda: float = 0.95,
-    ):
-        """Compute returns and advantages using GAE."""
-        rewards = np.array(self.rewards)
-        values = np.array(self.values)
-        dones = np.array(self.dones)
-        
-        advantages = np.zeros_like(rewards)
-        last_gae = 0
-        
-        for t in reversed(range(len(rewards))):
-            if t == len(rewards) - 1:
-                next_value = last_value
-                next_non_terminal = 1.0 - dones[t]
-            else:
-                next_value = values[t + 1]
-                next_non_terminal = 1.0 - dones[t]
-            
-            delta = rewards[t] + gamma * next_value * next_non_terminal - values[t]
-            advantages[t] = last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
-        
-        self.advantages = advantages
-        self.returns = advantages + values
-    
-    def get(self) -> Dict[str, np.ndarray]:
-        return {
-            "observations": np.array(self.observations),
-            "actions": np.array(self.actions),
-            "rewards": np.array(self.rewards),
-            "dones": np.array(self.dones),
-            "values": np.array(self.values),
-            "log_probs": np.array(self.log_probs),
-            "advantages": self.advantages if self.advantages is not None else np.zeros(len(self.rewards)),
-            "returns": self.returns if self.returns is not None else np.zeros(len(self.rewards)),
-        }
 
 
 def collect_rollouts(

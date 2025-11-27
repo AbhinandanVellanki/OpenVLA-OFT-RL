@@ -26,8 +26,31 @@ from prismatic.vla.constants import ACTION_DIM
 DEVICE = torch.device("cuda:1") if torch.cuda.is_available() else torch.device("cpu")
 OPENVLA_IMAGE_SIZE = 224
 
+
+def resolve_model_path(model_path: str) -> str:
+    """Resolve model path - handle both absolute and relative paths."""
+    if os.path.isabs(model_path):
+        return model_path
+    
+    # Try relative to current file's directory (vla-oft/min_vla -> vla-oft/)
+    current_file_dir = Path(__file__).resolve().parent.parent
+    local_path = current_file_dir / model_path
+    
+    if local_path.exists():
+        return str(local_path)
+    
+    # If not found locally, assume it's a HF model ID
+    return model_path
+
+
 def model_is_on_hf_hub(model_path: str) -> bool:
     """Check if model path points to HuggingFace Hub."""
+    # First check if it's a local path
+    resolved_path = resolve_model_path(model_path)
+    if os.path.isdir(resolved_path):
+        return False
+    
+    # Otherwise check HF Hub
     try:
         HfApi().model_info(model_path)
         return True
@@ -36,33 +59,41 @@ def model_is_on_hf_hub(model_path: str) -> bool:
 
 
 def update_auto_map(pretrained_checkpoint: str) -> None:
-    """Update AutoMap configuration in checkpoint config.json."""
-    if not os.path.isdir(pretrained_checkpoint):
+    """Update AutoMap configuration in checkpoint config.json to use local code."""
+    resolved_path = resolve_model_path(pretrained_checkpoint)
+    
+    if not os.path.isdir(resolved_path):
         return
 
-    config_path = os.path.join(pretrained_checkpoint, "config.json")
+    config_path = os.path.join(resolved_path, "config.json")
     if not os.path.exists(config_path):
         return
 
     with open(config_path, "r") as f:
         config = json.load(f)
 
+    # Point to local prismatic code
     config["auto_map"] = {
         "AutoConfig": "configuration_prismatic.OpenVLAConfig",
         "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
+        "AutoImageProcessor": "processing_prismatic.PrismaticImageProcessor",
+        "AutoProcessor": "processing_prismatic.PrismaticProcessor",
     }
 
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
+    
+    print(f"✓ Updated {config_path} to use local prismatic code")
 
 
 def find_checkpoint_file(pretrained_checkpoint: str, file_pattern: str) -> str:
     """Find checkpoint file matching pattern."""
-    assert os.path.isdir(pretrained_checkpoint), f"Checkpoint path must be a directory: {pretrained_checkpoint}"
+    resolved_path = resolve_model_path(pretrained_checkpoint)
+    assert os.path.isdir(resolved_path), f"Checkpoint path must be a directory: {resolved_path}"
 
     checkpoint_files = [
-        os.path.join(pretrained_checkpoint, f)
-        for f in os.listdir(pretrained_checkpoint)
+        os.path.join(resolved_path, f)
+        for f in os.listdir(resolved_path)
         if file_pattern in f and "checkpoint" in f
     ]
 
@@ -82,36 +113,34 @@ def load_component_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
 def get_vla(cfg: Any) -> torch.nn.Module:
     """Load and initialize VLA model from checkpoint."""
     print("Loading pretrained VLA policy...")
+    
+    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint)
+    is_local = os.path.isdir(resolved_checkpoint)
+    
+    if is_local:
+        print(f"✓ Using local model from: {resolved_checkpoint}")
+    else:
+        print(f"✓ Using HuggingFace Hub model: {cfg.pretrained_checkpoint}")
 
-    if not model_is_on_hf_hub(cfg.pretrained_checkpoint):
-        AutoConfig.register("openvla", OpenVLAConfig)
-        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
-        update_auto_map(cfg.pretrained_checkpoint)
+    # ALWAYS register local classes - this forces use of local code
+    AutoConfig.register("openvla", OpenVLAConfig)
+    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+    
+    # Update auto_map if local checkpoint
+    if is_local:
+        update_auto_map(resolved_checkpoint)
 
     # Attention implementation selection
-    # Default to "eager" to avoid _supports_sdpa compatibility issues
     attn_implementation = "eager"
     
-    # Flash Attention 2 support (commented - uncomment if flash-attn is installed)
-    # if hasattr(cfg, 'use_flash_attention') and cfg.use_flash_attention:
-    #     try:
-    #         import flash_attn
-    #         attn_implementation = "flash_attention_2"
-    #         print("Using Flash Attention 2 for faster inference")
-    #     except ImportError:
-    #         print("Warning: flash-attn not installed, falling back to eager attention")
-    #         attn_implementation = "eager"
-    
-    # Alternative: SDPA (Scaled Dot Product Attention) - may have compatibility issues
-    # attn_implementation = "sdpa"  # Uncomment to try SDPA (requires compatible transformers version)
-
+    # Load model - uses LOCAL registered classes instead of remote code
     vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.pretrained_checkpoint,
+        resolved_checkpoint,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
-        trust_remote_code=True,
+        trust_remote_code=False,  # Use local code only!
         attn_implementation=attn_implementation,
     )
 
@@ -128,32 +157,55 @@ def get_vla(cfg: Any) -> torch.nn.Module:
 
 def _load_dataset_stats(vla: torch.nn.Module, checkpoint_path: str) -> None:
     """Load dataset statistics for action normalization."""
+    resolved_path = resolve_model_path(checkpoint_path)
+    
     if model_is_on_hf_hub(checkpoint_path):
         dataset_statistics_path = hf_hub_download(
             repo_id=checkpoint_path,
             filename="dataset_statistics.json",
         )
     else:
-        dataset_statistics_path = os.path.join(checkpoint_path, "dataset_statistics.json")
+        dataset_statistics_path = os.path.join(resolved_path, "dataset_statistics.json")
 
     if os.path.isfile(dataset_statistics_path):
         with open(dataset_statistics_path, "r") as f:
             vla.norm_stats = json.load(f)
+        print(f"✓ Loaded dataset statistics from: {dataset_statistics_path}")
     else:
         print("WARNING: No dataset_statistics.json found. May cause errors when calling predict_action().")
 
 
 def get_processor(cfg: Any) -> AutoProcessor:
-    """Get VLA model's processor.
-    This is the processor that will be used to preprocess the images before passing them to the VLA model.
-    It is a PrismaticProcessor that is registered with the AutoProcessor class.
-    """
-    return AutoProcessor.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=True)
+    """Get VLA model's processor - uses local code."""
+    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint)
+    
+    # Register local processor first
+    AutoConfig.register("openvla", OpenVLAConfig)
+    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+    
+    return AutoProcessor.from_pretrained(
+        resolved_checkpoint, 
+        trust_remote_code=False  # Use local code only
+    )
 
 
-def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int, device: Optional[torch.device] = None) -> ProprioProjector:
+def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int, device: Optional[torch.device] = None, vla: Optional[torch.nn.Module] = None) -> ProprioProjector:
     """Get proprioception projector."""
     target_device = device if device is not None else DEVICE
+    
+    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint)
+    is_local = os.path.isdir(resolved_checkpoint)
+
+    # For local models, extract proprio_projector from VLA model if available
+    if is_local and vla is not None and hasattr(vla, 'proprio_projector'):
+        print(f"✓ Using proprio projector from VLA model (integrated)")
+        proprio_projector = vla.proprio_projector
+        if device is not None and str(proprio_projector.linear.weight.device) != str(device):
+            proprio_projector = proprio_projector.to(device)
+        return proprio_projector
+
+    # Otherwise create new and load from checkpoint
     proprio_projector = ProprioProjector(llm_dim=llm_dim, proprio_dim=proprio_dim).to(target_device)
     proprio_projector = proprio_projector.to(torch.bfloat16).eval()
 
@@ -174,16 +226,41 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int, device: Opti
         state_dict = load_component_state_dict(proprio_projector_path)
         proprio_projector.load_state_dict(state_dict)
     else:
-        checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "proprio_projector")
-        state_dict = load_component_state_dict(checkpoint_path)
-        proprio_projector.load_state_dict(state_dict)
+        # Try to find separate checkpoint file
+        resolved_path = resolve_model_path(cfg.pretrained_checkpoint)
+        checkpoint_files = [
+            f for f in os.listdir(resolved_path)
+            if "proprio_projector" in f and "checkpoint" in f
+        ]
+        
+        if len(checkpoint_files) == 1:
+            checkpoint_path = os.path.join(resolved_path, checkpoint_files[0])
+            state_dict = load_component_state_dict(checkpoint_path)
+            proprio_projector.load_state_dict(state_dict)
+            print(f"✓ Loaded proprio projector from: {checkpoint_path}")
+        else:
+            print(f"⚠ No separate proprio_projector checkpoint found (found {len(checkpoint_files)} files)")
+            print("  Assuming proprio_projector is integrated in main model")
 
     return proprio_projector
 
 
-def get_action_head(cfg: Any, llm_dim: int, device: Optional[torch.device] = None) -> L1RegressionActionHead:
+def get_action_head(cfg: Any, llm_dim: int, device: Optional[torch.device] = None, vla: Optional[torch.nn.Module] = None) -> L1RegressionActionHead:
     """Get L1 regression action head."""
     target_device = device if device is not None else DEVICE
+    
+    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint)
+    is_local = os.path.isdir(resolved_checkpoint)
+
+    # For local models, extract action_head from VLA model if available
+    if is_local and vla is not None and hasattr(vla, 'action_head'):
+        print(f"✓ Using action head from VLA model (integrated)")
+        action_head = vla.action_head
+        if device is not None and str(action_head.fc1.weight.device) != str(device):
+            action_head = action_head.to(device)
+        return action_head
+
+    # Otherwise create new and load from checkpoint
     action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
     action_head = action_head.to(torch.bfloat16).to(target_device).eval()
 
@@ -204,9 +281,21 @@ def get_action_head(cfg: Any, llm_dim: int, device: Optional[torch.device] = Non
         state_dict = load_component_state_dict(action_head_path)
         action_head.load_state_dict(state_dict)
     else:
-        checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "action_head")
-        state_dict = load_component_state_dict(checkpoint_path)
-        action_head.load_state_dict(state_dict)
+        # Try to find separate checkpoint file
+        resolved_path = resolve_model_path(cfg.pretrained_checkpoint)
+        checkpoint_files = [
+            f for f in os.listdir(resolved_path)
+            if "action_head" in f and "checkpoint" in f
+        ]
+        
+        if len(checkpoint_files) == 1:
+            checkpoint_path = os.path.join(resolved_path, checkpoint_files[0])
+            state_dict = load_component_state_dict(checkpoint_path)
+            action_head.load_state_dict(state_dict)
+            print(f"✓ Loaded action head from: {checkpoint_path}")
+        else:
+            print(f"⚠ No separate action_head checkpoint found (found {len(checkpoint_files)} files)")
+            print("  Assuming action_head is integrated in main model")
 
     return action_head
 

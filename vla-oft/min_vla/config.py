@@ -4,10 +4,10 @@ from dataclasses import dataclass
 @dataclass
 class OpenVLAActorConfig:
     """
-    Minimal config to load OpenVLA-OFT 7B Libero-Spatial from HF and use it as an actor.
+    Minimal config to load OpenVLA-OFT 7B Libero-Spatial from local directory.
     """
-    # HuggingFace repo id
-    pretrained_checkpoint: str = "moojink/openvla-7b-oft-finetuned-libero-spatial"
+    # Local model directory (relative to vla-oft folder)
+    pretrained_checkpoint: str = "openvla-7b-finetuned-libero-spatial" # using local checkpoint
 
     # Device configuration for multi-GPU setup
     device: str = "cuda:1"  # Main device for VLA model (~14GB)

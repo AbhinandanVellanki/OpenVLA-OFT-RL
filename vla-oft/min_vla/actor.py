@@ -58,14 +58,14 @@ class OpenVLAActor:
             # Libero spatial proprio dim is 8 (see constants or blog), but you can also infer
             proprio_dim = 8 # 7 joints + gripper
             self.proprio_projector = openvla_utils.get_proprio_projector(
-                cfg, llm_dim=llm_dim, proprio_dim=proprio_dim, device=self.proprio_device
+                cfg, llm_dim=llm_dim, proprio_dim=proprio_dim, device=self.proprio_device, vla=self.vla
             )
 
         # 4) Load continuous action head on GPU 0
         self.action_head = None
         if cfg.use_l1_regression and not cfg.finetuned_on_discrete_actions:
             llm_dim = self.vla.llm_dim
-            self.action_head = openvla_utils.get_action_head(cfg, llm_dim=llm_dim, device=self.action_head_device)
+            self.action_head = openvla_utils.get_action_head(cfg, llm_dim=llm_dim, device=self.action_head_device, vla=self.vla)
 
         self.state = OpenVLAActorState(
             vla=self.vla,

@@ -9,8 +9,10 @@ class OpenVLAActorConfig:
     # HuggingFace repo id
     pretrained_checkpoint: str = "moojink/openvla-7b-oft-finetuned-libero-spatial"
 
-    # Device
-    device: str = "cuda"
+    # Device configuration for multi-GPU setup
+    device: str = "cuda:1"  # Main device for VLA model (~14GB)
+    action_head_device: str = "cuda:0"  # Device for action head (~134MB)
+    proprio_projector_device: str = "cuda:0"  # Device for proprio projector (~66MB)
 
     # Quantization (removing for now)
     # load_in_8bit: bool = False

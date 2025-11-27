@@ -11,6 +11,11 @@ from huggingface_hub import HfApi, hf_hub_download
 from PIL import Image
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
+# add current directory to path so imports work
+current_dir = Path(__file__).resolve().parent.parent
+import sys
+sys.path.append(str(current_dir))
+
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
@@ -18,9 +23,8 @@ from prismatic.models.action_heads import L1RegressionActionHead
 from prismatic.models.projectors import ProprioProjector
 from prismatic.vla.constants import ACTION_DIM
 
-DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+DEVICE = torch.device("cuda:1") if torch.cuda.is_available() else torch.device("cpu")
 OPENVLA_IMAGE_SIZE = 224
-
 
 def model_is_on_hf_hub(model_path: str) -> bool:
     """Check if model path points to HuggingFace Hub."""
@@ -147,9 +151,10 @@ def get_processor(cfg: Any) -> AutoProcessor:
     return AutoProcessor.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=True)
 
 
-def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioProjector:
+def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int, device: Optional[torch.device] = None) -> ProprioProjector:
     """Get proprioception projector."""
-    proprio_projector = ProprioProjector(llm_dim=llm_dim, proprio_dim=proprio_dim).to(DEVICE)
+    target_device = device if device is not None else DEVICE
+    proprio_projector = ProprioProjector(llm_dim=llm_dim, proprio_dim=proprio_dim).to(target_device)
     proprio_projector = proprio_projector.to(torch.bfloat16).eval()
 
     if model_is_on_hf_hub(cfg.pretrained_checkpoint):
@@ -176,10 +181,11 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
     return proprio_projector
 
 
-def get_action_head(cfg: Any, llm_dim: int) -> L1RegressionActionHead:
+def get_action_head(cfg: Any, llm_dim: int, device: Optional[torch.device] = None) -> L1RegressionActionHead:
     """Get L1 regression action head."""
+    target_device = device if device is not None else DEVICE
     action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
-    action_head = action_head.to(torch.bfloat16).to(DEVICE).eval()
+    action_head = action_head.to(torch.bfloat16).to(target_device).eval()
 
     if model_is_on_hf_hub(cfg.pretrained_checkpoint):
         model_path_to_action_head_name = {

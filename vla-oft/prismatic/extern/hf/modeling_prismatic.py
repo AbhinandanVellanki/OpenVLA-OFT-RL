@@ -452,7 +452,18 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             # projected_patch_embeddings: (bsz, num_patches * num_images, llm_dim)
             # proprio: (bsz, proprio_dim) or (propro_dim,)
             proprio = proprio.reshape(projected_patch_embeddings.shape[0], -1)  # (bsz, proprio_dim)
+            
+            # Handle multi-GPU: move proprio to proprio_projector device if different
+            proprio_device = next(proprio_projector.parameters()).device
+            if proprio.device != proprio_device:
+                proprio = proprio.to(proprio_device)
+            
             proprio_features = proprio_projector(proprio)  # (bsz, llm_dim)
+            
+            # Move proprio_features back to projected_patch_embeddings device
+            if proprio_features.device != projected_patch_embeddings.device:
+                proprio_features = proprio_features.to(projected_patch_embeddings.device)
+            
             proprio_features = proprio_features.unsqueeze(dim=1)  # (bsz, 1, llm_dim)
             # For simplicity, just append proprio token to the end of projected vision patch tokens
             return torch.cat((projected_patch_embeddings, proprio_features), dim=1)
@@ -920,7 +931,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Handle different prediction methods
         if action_head is not None:
             # L1 regression prediction
-            normalized_actions = action_head.predict_action(actions_hidden_states)
+            # Move hidden states to action_head device if different (for multi-GPU setup)
+            action_head_device = next(action_head.parameters()).device
+            if actions_hidden_states.device != action_head_device:
+                actions_hidden_states_on_head_device = actions_hidden_states.to(action_head_device)
+            else:
+                actions_hidden_states_on_head_device = actions_hidden_states
+            
+            normalized_actions = action_head.predict_action(actions_hidden_states_on_head_device)
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
         else:

@@ -36,29 +36,36 @@ class OpenVLAActor:
 
     def __init__(self, cfg: OpenVLAActorConfig) -> None:
         self.cfg = cfg
-        self.device = torch.device(cfg.device)
+        self.device = torch.device(cfg.device)  # Main device for VLA (GPU 1)
+        self.action_head_device = torch.device(cfg.action_head_device)  # GPU 0
+        self.proprio_device = torch.device(cfg.proprio_projector_device)  # GPU 0
+
+        print(f"🔧 Multi-GPU Setup:")
+        print(f"   VLA Model → {cfg.device} (requires ~14GB)")
+        print(f"   Action Head → {cfg.action_head_device} (requires ~134MB)")
+        print(f"   Proprio Projector → {cfg.proprio_projector_device} (requires ~66MB)")
 
         # 1) Load VLA model from HF (this pulls modeling_prismatic, etc.)
-        self.vla = openvla_utils.get_vla(cfg) # return vla model in eval mode
+        self.vla = openvla_utils.get_vla(cfg) # return vla model in eval mode on GPU 1
 
         # 2) Load HF processor (handles tokenization + image preprocessing)
         self.processor = openvla_utils.get_processor(cfg)
 
-        # 3) Load proprio projector (if using proprio)
+        # 3) Load proprio projector (if using proprio) on GPU 0
         self.proprio_projector = None
         if cfg.use_proprio:
             llm_dim = self.vla.llm_dim   # defined in modeling_prismatic.OpenVLAForActionPrediction
             # Libero spatial proprio dim is 8 (see constants or blog), but you can also infer
             proprio_dim = 8 # 7 joints + gripper
             self.proprio_projector = openvla_utils.get_proprio_projector(
-                cfg, llm_dim=llm_dim, proprio_dim=proprio_dim
+                cfg, llm_dim=llm_dim, proprio_dim=proprio_dim, device=self.proprio_device
             )
 
-        # 4) Load continuous action head
+        # 4) Load continuous action head on GPU 0
         self.action_head = None
         if cfg.use_l1_regression and not cfg.finetuned_on_discrete_actions:
             llm_dim = self.vla.llm_dim
-            self.action_head = openvla_utils.get_action_head(cfg, llm_dim=llm_dim)
+            self.action_head = openvla_utils.get_action_head(cfg, llm_dim=llm_dim, device=self.action_head_device)
 
         self.state = OpenVLAActorState(
             vla=self.vla,
@@ -113,11 +120,17 @@ class OpenVLAActor:
         attention_mask = proc_out["attention_mask"].to(self.device)
         pixel_values = proc_out["pixel_values"].to(self.device, dtype=self.vla.dtype)  # Match model dtype (bfloat16)
 
+        # Handle proprio on GPU 0 if needed
+        proprio_tensor = None
+        if proprio is not None and self.proprio_projector is not None:
+            proprio_tensor = torch.from_numpy(proprio).to(self.proprio_device, dtype=torch.float32)
+
         # 2) Call VLA's predict_action API (defined in modeling_prismatic)
+        # VLA on GPU 1, will handle cross-GPU transfers internally
         actions, action_hidden_states = self.vla.predict_action(
             input_ids=input_ids,
             unnorm_key=unnorm_key,
-            proprio=proprio,
+            proprio=proprio_tensor if proprio_tensor is not None else proprio,
             proprio_projector=self.proprio_projector,
             action_head=self.action_head,
             pixel_values=pixel_values,

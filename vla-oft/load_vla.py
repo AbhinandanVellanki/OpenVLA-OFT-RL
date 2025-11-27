@@ -45,7 +45,7 @@ def load_openvla_oft(
     """
     # Auto-detect device if not specified
     if device is None:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        device = "cuda:1" if torch.cuda.is_available() else "cpu"
     
     # Default to bfloat16 if CUDA available, else float32
     if torch_dtype is None:
@@ -114,7 +114,7 @@ class OpenVLAOFTModel:
             torch_dtype=torch_dtype,
             use_flash_attention=use_flash_attention,
         )
-        self.device = device if device else ("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = device if device else ("cuda:1" if torch.cuda.is_available() else "cpu")
     
     def forward(self, prompt: str, images, return_tensors: str = "pt", **kwargs):
         """

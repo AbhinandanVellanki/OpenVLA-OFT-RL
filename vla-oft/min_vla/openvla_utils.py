@@ -27,9 +27,18 @@ DEVICE = torch.device("cuda:1") if torch.cuda.is_available() else torch.device("
 OPENVLA_IMAGE_SIZE = 224
 
 
-def resolve_model_path(model_path: str) -> str:
-    """Resolve model path - handle both absolute and relative paths."""
+def resolve_model_path(model_path: str, use_local: bool = True) -> str:
+    """Resolve model path - handle both absolute and relative paths.
+    
+    Args:
+        model_path: Path to model (absolute, relative, or HF repo ID)
+        use_local: If True, try to use local directory first; if False, always use HF Hub
+    """
     if os.path.isabs(model_path):
+        return model_path
+    
+    # If use_local=False, always return the path as-is (for HF Hub)
+    if not use_local:
         return model_path
     
     # Try relative to current file's directory (vla-oft/min_vla -> vla-oft/)
@@ -43,10 +52,10 @@ def resolve_model_path(model_path: str) -> str:
     return model_path
 
 
-def model_is_on_hf_hub(model_path: str) -> bool:
+def model_is_on_hf_hub(model_path: str, use_local: bool = True) -> bool:
     """Check if model path points to HuggingFace Hub."""
     # First check if it's a local path
-    resolved_path = resolve_model_path(model_path)
+    resolved_path = resolve_model_path(model_path, use_local=use_local)
     if os.path.isdir(resolved_path):
         return False
     
@@ -114,7 +123,8 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     """Load and initialize VLA model from checkpoint."""
     print("Loading pretrained VLA policy...")
     
-    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint)
+    use_local = getattr(cfg, 'use_local', True)
+    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint, use_local=use_local)
     is_local = os.path.isdir(resolved_checkpoint)
     
     if is_local:
@@ -151,15 +161,15 @@ def get_vla(cfg: Any) -> torch.nn.Module:
        not (hasattr(cfg, 'load_in_4bit') and cfg.load_in_4bit):
         vla = vla.to(DEVICE)
 
-    _load_dataset_stats(vla, cfg.pretrained_checkpoint)
+    _load_dataset_stats(vla, cfg.pretrained_checkpoint, use_local=use_local)
     return vla
 
 
-def _load_dataset_stats(vla: torch.nn.Module, checkpoint_path: str) -> None:
+def _load_dataset_stats(vla: torch.nn.Module, checkpoint_path: str, use_local: bool = True) -> None:
     """Load dataset statistics for action normalization."""
-    resolved_path = resolve_model_path(checkpoint_path)
+    resolved_path = resolve_model_path(checkpoint_path, use_local=use_local)
     
-    if model_is_on_hf_hub(checkpoint_path):
+    if model_is_on_hf_hub(checkpoint_path, use_local=use_local):
         dataset_statistics_path = hf_hub_download(
             repo_id=checkpoint_path,
             filename="dataset_statistics.json",
@@ -177,7 +187,8 @@ def _load_dataset_stats(vla: torch.nn.Module, checkpoint_path: str) -> None:
 
 def get_processor(cfg: Any) -> AutoProcessor:
     """Get VLA model's processor - uses local code."""
-    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint)
+    use_local = getattr(cfg, 'use_local', True)
+    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint, use_local=use_local)
     
     # Register local processor first
     AutoConfig.register("openvla", OpenVLAConfig)
@@ -194,7 +205,8 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int, device: Opti
     """Get proprioception projector."""
     target_device = device if device is not None else DEVICE
     
-    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint)
+    use_local = getattr(cfg, 'use_local', True)
+    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint, use_local=use_local)
     is_local = os.path.isdir(resolved_checkpoint)
 
     # For local models, extract proprio_projector from VLA model if available
@@ -209,7 +221,7 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int, device: Opti
     proprio_projector = ProprioProjector(llm_dim=llm_dim, proprio_dim=proprio_dim).to(target_device)
     proprio_projector = proprio_projector.to(torch.bfloat16).eval()
 
-    if model_is_on_hf_hub(cfg.pretrained_checkpoint):
+    if model_is_on_hf_hub(cfg.pretrained_checkpoint, use_local=use_local):
         model_path_to_proprio_projector_name = {
             "moojink/openvla-7b-oft-finetuned-libero-spatial": "proprio_projector--150000_checkpoint.pt",
             "moojink/openvla-7b-oft-finetuned-libero-object": "proprio_projector--150000_checkpoint.pt",
@@ -249,7 +261,8 @@ def get_action_head(cfg: Any, llm_dim: int, device: Optional[torch.device] = Non
     """Get L1 regression action head."""
     target_device = device if device is not None else DEVICE
     
-    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint)
+    use_local = getattr(cfg, 'use_local', True)
+    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint, use_local=use_local)
     is_local = os.path.isdir(resolved_checkpoint)
 
     # For local models, extract action_head from VLA model if available
@@ -264,7 +277,7 @@ def get_action_head(cfg: Any, llm_dim: int, device: Optional[torch.device] = Non
     action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
     action_head = action_head.to(torch.bfloat16).to(target_device).eval()
 
-    if model_is_on_hf_hub(cfg.pretrained_checkpoint):
+    if model_is_on_hf_hub(cfg.pretrained_checkpoint, use_local=use_local):
         model_path_to_action_head_name = {
             "moojink/openvla-7b-oft-finetuned-libero-spatial": "action_head--150000_checkpoint.pt",
             "moojink/openvla-7b-oft-finetuned-libero-object": "action_head--150000_checkpoint.pt",

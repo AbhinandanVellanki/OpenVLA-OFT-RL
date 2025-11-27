@@ -6,8 +6,12 @@ class OpenVLAActorConfig:
     """
     Minimal config to load OpenVLA-OFT 7B Libero-Spatial from local directory.
     """
-    # Local model directory (relative to vla-oft folder)
-    pretrained_checkpoint: str = "openvla-7b-finetuned-libero-spatial" # using local checkpoint
+    # Model path: can be HuggingFace repo ID or local path (relative to vla-oft folder)
+    pretrained_checkpoint: str = "moojink/openvla-7b-oft-finetuned-libero-spatial"
+    
+    # Set to True to use local model, False to use HuggingFace Hub
+    # If True and local directory exists, uses local; otherwise falls back to HF
+    use_local: bool = False
 
     # Device configuration for multi-GPU setup
     device: str = "cuda:1"  # Main device for VLA model (~14GB)

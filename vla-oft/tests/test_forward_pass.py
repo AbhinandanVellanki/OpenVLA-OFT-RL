@@ -10,6 +10,7 @@ sys.path.append(str(current_dir))
 import pytest
 import numpy as np
 import torch
+import time
 
 from min_vla.config import OpenVLAActorConfig
 from min_vla.actor import OpenVLAActor
@@ -138,16 +139,34 @@ def test_forward_on_dummy_observation(actor):
     print(f"     ✓ Proprio shape: {dummy_proprio.shape}")
     print(f"     ✓ Task prompt: {task_prompt[:50]}...")
 
-    print("\n[4/5] Running forward pass...")
-    with torch.inference_mode():  # More memory efficient than torch.no_grad()
-        action, info = actor.forward(obs, task_prompt)
+    print("\n[4/5] Running forward pass with timing...")
     
-    # Synchronize to get accurate memory measurements
+    # Warm up
+    with torch.inference_mode():
+        _ = actor.forward(obs, task_prompt)
     if torch.cuda.is_available():
         torch.cuda.synchronize(0)
         torch.cuda.synchronize(1)
     
+    # Timed forward pass
+    start_time = time.time()
+    with torch.inference_mode():  # More memory efficient than torch.no_grad()
+        action, info = actor.forward(obs, task_prompt)
+    
+    # Synchronize to get accurate timing
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(0)
+        torch.cuda.synchronize(1)
+    
+    inference_time = time.time() - start_time
+    inference_hz = 1.0 / inference_time if inference_time > 0 else 0
+    
     print("     ✓ Forward pass completed")
+    print(f"     ⏱️  Inference time: {inference_time*1000:.2f} ms ({inference_hz:.1f} Hz)")
+    if inference_hz >= 100:
+        print(f"     ✓ Achieves 100Hz target!")
+    else:
+        print(f"     ⚠️  Below 100Hz target (expected ~10ms, got {inference_time*1000:.2f}ms)")
     
     print("\n     GPU memory during/after inference:")
     print_gpu_memory()
@@ -255,13 +274,33 @@ def test_multiple_forward_passes_memory_stable(actor):
         baseline_gpu0 = torch.cuda.memory_allocated(0) / 1024**3
         baseline_gpu1 = torch.cuda.memory_allocated(1) / 1024**3
     
-    print("\n[4/4] Running 10 more passes to check for memory leaks...")
+    print("\n[4/4] Running 10 more passes to check for memory leaks and benchmark speed...")
+    inference_times = []
     with torch.inference_mode():
         for i in range(10):
+            start = time.time()
             action, _ = actor.forward(obs, task_prompt)
             if torch.cuda.is_available():
                 torch.cuda.synchronize(0)
                 torch.cuda.synchronize(1)
+            inference_times.append(time.time() - start)
+    
+    # Calculate statistics
+    avg_time = np.mean(inference_times) * 1000  # ms
+    std_time = np.std(inference_times) * 1000   # ms
+    min_time = np.min(inference_times) * 1000   # ms
+    max_time = np.max(inference_times) * 1000   # ms
+    avg_hz = 1000.0 / avg_time
+    
+    print("\n     Inference timing statistics (10 runs):")
+    print(f"     Average: {avg_time:.2f} ± {std_time:.2f} ms ({avg_hz:.1f} Hz)")
+    print(f"     Min: {min_time:.2f} ms ({1000.0/min_time:.1f} Hz)")
+    print(f"     Max: {max_time:.2f} ms ({1000.0/max_time:.1f} Hz)")
+    
+    if avg_hz >= 100:
+        print(f"     ✓ Achieves 100Hz target! (avg {avg_hz:.1f} Hz)")
+    else:
+        print(f"     ⚠️  Below 100Hz target: {avg_hz:.1f} Hz (expected ≥100 Hz)")
     
     print("\n     Final memory:")
     print_gpu_memory()

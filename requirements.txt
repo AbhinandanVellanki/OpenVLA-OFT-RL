@@ -1,0 +1,22 @@
+# Core ML Framework Dependencies
+torch==2.2.2
+torchvision==0.17.2
+numpy==1.24.4
+
+# Transformers & HuggingFace
+transformers==4.40.1
+tokenizers==0.19.1
+accelerate>=1.12.0
+safetensors>=0.4.1
+
+# VLA-specific dependencies
+pillow>=5.3.0
+pyyaml>=5.1
+tqdm>=4.27
+
+# Testing
+pytest>=7.0.0
+
+# Optional but recommended for reproducibility:
+# Use `pip install -r requirements.txt` to install core dependencies
+# Use `pip install -r requirements_frozen.txt` for exact environment replication

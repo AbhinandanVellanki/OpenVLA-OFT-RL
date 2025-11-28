@@ -23,13 +23,21 @@ from prismatic.models.action_heads import L1RegressionActionHead
 from prismatic.models.projectors import ProprioProjector
 from prismatic.vla.constants import ACTION_DIM
 
-DEVICE = torch.device("cuda:1") if torch.cuda.is_available() else torch.device("cpu")
 OPENVLA_IMAGE_SIZE = 224
 
 
-def resolve_model_path(model_path: str) -> str:
-    """Resolve model path - handle both absolute and relative paths."""
+def resolve_model_path(model_path: str, use_local: bool = True) -> str:
+    """Resolve model path - handle both absolute and relative paths.
+    
+    Args:
+        model_path: Path to model (absolute, relative, or HF repo ID)
+        use_local: If True, try to use local directory first; if False, always use HF Hub
+    """
     if os.path.isabs(model_path):
+        return model_path
+    
+    # If use_local=False, always return the path as-is (for HF Hub)
+    if not use_local:
         return model_path
     
     # Try relative to current file's directory (vla-oft/min_vla -> vla-oft/)
@@ -43,10 +51,10 @@ def resolve_model_path(model_path: str) -> str:
     return model_path
 
 
-def model_is_on_hf_hub(model_path: str) -> bool:
+def model_is_on_hf_hub(model_path: str, use_local: bool = True) -> bool:
     """Check if model path points to HuggingFace Hub."""
     # First check if it's a local path
-    resolved_path = resolve_model_path(model_path)
+    resolved_path = resolve_model_path(model_path, use_local=use_local)
     if os.path.isdir(resolved_path):
         return False
     
@@ -114,7 +122,8 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     """Load and initialize VLA model from checkpoint."""
     print("Loading pretrained VLA policy...")
     
-    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint)
+    use_local = getattr(cfg, 'use_local', True)
+    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint, use_local=use_local)
     is_local = os.path.isdir(resolved_checkpoint)
     
     if is_local:
@@ -133,7 +142,44 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         update_auto_map(resolved_checkpoint)
 
     # Attention implementation selection
-    attn_implementation = "eager"
+    attn_implementation = "eager"  # Default
+    
+    if hasattr(cfg, 'use_flash_attention') and cfg.use_flash_attention:
+        try:
+            import flash_attn
+            attn_implementation = "flash_attention_2"
+            print(f"✓ Using Flash Attention 2 (flash_attn version: {flash_attn.__version__})")
+        except ImportError:
+            print("⚠️  Flash Attention 2 requested but flash-attn not installed, falling back to eager")
+            print("   Install with: pip install flash-attn --no-build-isolation")
+            attn_implementation = "eager"
+    else:
+        print("ℹ️  Using eager attention (set use_flash_attention=True for faster inference)")
+    
+    # Quantization configuration
+    load_in_4bit = hasattr(cfg, 'load_in_4bit') and cfg.load_in_4bit
+    load_in_8bit = hasattr(cfg, 'load_in_8bit') and cfg.load_in_8bit
+    
+    quantization_config = None
+    if load_in_4bit or load_in_8bit:
+        try:
+            from transformers import BitsAndBytesConfig
+            if load_in_4bit:
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4"
+                )
+                print(f"✓ Using 4-bit quantization (NF4, double quant)")
+            elif load_in_8bit:
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+                print(f"✓ Using 8-bit quantization")
+        except ImportError:
+            print("⚠️  Quantization requested but bitsandbytes not installed")
+            print("   Install with: pip install bitsandbytes")
+            load_in_4bit = False
+            load_in_8bit = False
     
     # Load model - uses LOCAL registered classes instead of remote code
     vla = AutoModelForVision2Seq.from_pretrained(
@@ -142,14 +188,29 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         low_cpu_mem_usage=True,
         trust_remote_code=False,  # Use local code only!
         attn_implementation=attn_implementation,
+        quantization_config=quantization_config,
+        device_map="auto" if (load_in_4bit or load_in_8bit) else None,
     )
+    
+    # Verify attention implementation after loading
+    try:
+        if hasattr(vla, 'language_model') and hasattr(vla.language_model, 'model'):
+            first_layer = vla.language_model.model.layers[0]
+            if hasattr(first_layer, 'self_attn'):
+                attn_class = first_layer.self_attn.__class__.__name__
+                print(f"✓ Model loaded with attention: {attn_class}")
+    except:
+        pass
 
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
     vla.eval()
 
-    if not (hasattr(cfg, 'load_in_8bit') and cfg.load_in_8bit) and \
-       not (hasattr(cfg, 'load_in_4bit') and cfg.load_in_4bit):
-        vla = vla.to(DEVICE)
+    # Move to device only if not using quantization (quantization uses device_map)
+    if not load_in_4bit and not load_in_8bit:
+        device = torch.device(cfg.device)
+        vla = vla.to(device)
+    else:
+        print(f"✓ Model loaded with device_map='auto' (quantization enabled)")
 
     _load_dataset_stats(vla, cfg.pretrained_checkpoint)
     return vla
@@ -177,7 +238,8 @@ def _load_dataset_stats(vla: torch.nn.Module, checkpoint_path: str) -> None:
 
 def get_processor(cfg: Any) -> AutoProcessor:
     """Get VLA model's processor - uses local code."""
-    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint)
+    use_local = getattr(cfg, 'use_local', True)
+    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint, use_local=use_local)
     
     # Register local processor first
     AutoConfig.register("openvla", OpenVLAConfig)
@@ -192,9 +254,12 @@ def get_processor(cfg: Any) -> AutoProcessor:
 
 def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int, device: Optional[torch.device] = None, vla: Optional[torch.nn.Module] = None) -> ProprioProjector:
     """Get proprioception projector."""
-    target_device = device if device is not None else DEVICE
+    if device is None:
+        device = torch.device(cfg.proprio_projector_device)
+    target_device = device
     
-    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint)
+    use_local = getattr(cfg, 'use_local', True)
+    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint, use_local=use_local)
     is_local = os.path.isdir(resolved_checkpoint)
 
     # For local models, extract proprio_projector from VLA model if available
@@ -209,7 +274,7 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int, device: Opti
     proprio_projector = ProprioProjector(llm_dim=llm_dim, proprio_dim=proprio_dim).to(target_device)
     proprio_projector = proprio_projector.to(torch.bfloat16).eval()
 
-    if model_is_on_hf_hub(cfg.pretrained_checkpoint):
+    if model_is_on_hf_hub(cfg.pretrained_checkpoint, use_local=use_local):
         model_path_to_proprio_projector_name = {
             "moojink/openvla-7b-oft-finetuned-libero-spatial": "proprio_projector--150000_checkpoint.pt",
             "moojink/openvla-7b-oft-finetuned-libero-object": "proprio_projector--150000_checkpoint.pt",
@@ -247,9 +312,12 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int, device: Opti
 
 def get_action_head(cfg: Any, llm_dim: int, device: Optional[torch.device] = None, vla: Optional[torch.nn.Module] = None) -> L1RegressionActionHead:
     """Get L1 regression action head."""
-    target_device = device if device is not None else DEVICE
+    if device is None:
+        device = torch.device(cfg.action_head_device)
+    target_device = device
     
-    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint)
+    use_local = getattr(cfg, 'use_local', True)
+    resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint, use_local=use_local)
     is_local = os.path.isdir(resolved_checkpoint)
 
     # For local models, extract action_head from VLA model if available
@@ -264,7 +332,7 @@ def get_action_head(cfg: Any, llm_dim: int, device: Optional[torch.device] = Non
     action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
     action_head = action_head.to(torch.bfloat16).to(target_device).eval()
 
-    if model_is_on_hf_hub(cfg.pretrained_checkpoint):
+    if model_is_on_hf_hub(cfg.pretrained_checkpoint, use_local=use_local):
         model_path_to_action_head_name = {
             "moojink/openvla-7b-oft-finetuned-libero-spatial": "action_head--150000_checkpoint.pt",
             "moojink/openvla-7b-oft-finetuned-libero-object": "action_head--150000_checkpoint.pt",
@@ -332,6 +400,7 @@ def get_vla_action(
     proprio_projector: Optional[torch.nn.Module] = None,
 ) -> List[np.ndarray]:
     """Generate action predictions with VLA policy."""
+    device = torch.device(cfg.device)
     with torch.inference_mode():
         # Collect input images
         all_images = [obs["full_image"]]
@@ -346,12 +415,12 @@ def get_vla_action(
         prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
 
         # Process primary image
-        inputs = processor(prompt, primary_image).to(DEVICE, dtype=torch.bfloat16)
+        inputs = processor(prompt, primary_image).to(device, dtype=torch.bfloat16)
 
         # Process additional wrist images if any
         if all_images:
             all_wrist_inputs = [
-                processor(prompt, image_wrist).to(DEVICE, dtype=torch.bfloat16) for image_wrist in all_images
+                processor(prompt, image_wrist).to(device, dtype=torch.bfloat16) for image_wrist in all_images
             ]
             primary_pixel_values = inputs["pixel_values"]
             all_wrist_pixel_values = [wrist_inputs["pixel_values"] for wrist_inputs in all_wrist_inputs]

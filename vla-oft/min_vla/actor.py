@@ -36,17 +36,21 @@ class OpenVLAActor:
 
     def __init__(self, cfg: OpenVLAActorConfig) -> None:
         self.cfg = cfg
-        self.device = torch.device(cfg.device)  # Main device for VLA (GPU 1)
-        self.action_head_device = torch.device(cfg.action_head_device)  # GPU 0
-        self.proprio_device = torch.device(cfg.proprio_projector_device)  # GPU 0
+        self.device = torch.device(cfg.device)  # Main device for VLA
+        self.action_head_device = torch.device(cfg.action_head_device)
+        self.proprio_device = torch.device(cfg.proprio_projector_device)
 
-        print(f"🔧 Multi-GPU Setup:")
-        print(f"   VLA Model → {cfg.device} (requires ~14GB)")
-        print(f"   Action Head → {cfg.action_head_device} (requires ~134MB)")
-        print(f"   Proprio Projector → {cfg.proprio_projector_device} (requires ~66MB)")
+        if cfg.use_multi_gpu:
+            print(f"🔧 Multi-GPU Setup:")
+            print(f"   VLA Model → {cfg.device} (requires ~14GB)")
+            print(f"   Action Head → {cfg.action_head_device} (requires ~134MB)")
+            print(f"   Proprio Projector → {cfg.proprio_projector_device} (requires ~66MB)")
+        else:
+            print(f"🔧 Single-GPU Setup:")
+            print(f"   All components on {cfg.device} (requires ~14.2GB total)")
 
         # 1) Load VLA model from HF (this pulls modeling_prismatic, etc.)
-        self.vla = openvla_utils.get_vla(cfg) # return vla model in eval mode on GPU 1
+        self.vla = openvla_utils.get_vla(cfg) # return vla model in eval mode
 
         # 2) Load HF processor (handles tokenization + image preprocessing)
         self.processor = openvla_utils.get_processor(cfg)

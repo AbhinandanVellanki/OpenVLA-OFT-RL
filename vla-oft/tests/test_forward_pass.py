@@ -24,9 +24,9 @@ GPU_REQUIRED_ENV = os.environ.get("OPENVLA_TEST_GPU_REQUIRED", "1") == "1"
 def actor():
     """Shared actor fixture to avoid loading model multiple times."""
     cfg = OpenVLAActorConfig(
-        device="cuda:1" if torch.cuda.is_available() else "cpu",
-        action_head_device="cuda:0" if torch.cuda.is_available() else "cpu",
-        proprio_projector_device="cuda:0" if torch.cuda.is_available() else "cpu"
+        use_multi_gpu=True if torch.cuda.device_count() >= 2 else False,
+        gpu_id=1 if torch.cuda.device_count() >= 2 else 0,
+        secondary_gpu_id=0
     )
     actor_instance = OpenVLAActor(cfg)
     yield actor_instance
@@ -56,10 +56,14 @@ def test_actor_loads_and_moves_to_device():
     
     print("\n[1/7] Creating config...")
     cfg = OpenVLAActorConfig(
-        device="cuda:1" if torch.cuda.is_available() else "cpu",
-        action_head_device="cuda:0" if torch.cuda.is_available() else "cpu",
-        proprio_projector_device="cuda:0" if torch.cuda.is_available() else "cpu"
+        use_multi_gpu=True if torch.cuda.device_count() >= 2 else False,
+        gpu_id=1 if torch.cuda.device_count() >= 2 else 0,
+        secondary_gpu_id=0
     )
+    print(f"     Use Multi-GPU: {cfg.use_multi_gpu}")
+    print(f"     GPU ID: {cfg.gpu_id}")
+    if cfg.use_multi_gpu:
+        print(f"     Secondary GPU ID: {cfg.secondary_gpu_id}")
     print(f"     VLA Device: {cfg.device}")
     print(f"     Action Head Device: {cfg.action_head_device}")
     print(f"     Proprio Device: {cfg.proprio_projector_device}")

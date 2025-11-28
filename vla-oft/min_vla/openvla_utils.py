@@ -23,7 +23,6 @@ from prismatic.models.action_heads import L1RegressionActionHead
 from prismatic.models.projectors import ProprioProjector
 from prismatic.vla.constants import ACTION_DIM
 
-DEVICE = torch.device("cuda:1") if torch.cuda.is_available() else torch.device("cpu")
 OPENVLA_IMAGE_SIZE = 224
 
 
@@ -143,7 +142,44 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         update_auto_map(resolved_checkpoint)
 
     # Attention implementation selection
-    attn_implementation = "eager"
+    attn_implementation = "eager"  # Default
+    
+    if hasattr(cfg, 'use_flash_attention') and cfg.use_flash_attention:
+        try:
+            import flash_attn
+            attn_implementation = "flash_attention_2"
+            print(f"✓ Using Flash Attention 2 (flash_attn version: {flash_attn.__version__})")
+        except ImportError:
+            print("⚠️  Flash Attention 2 requested but flash-attn not installed, falling back to eager")
+            print("   Install with: pip install flash-attn --no-build-isolation")
+            attn_implementation = "eager"
+    else:
+        print("ℹ️  Using eager attention (set use_flash_attention=True for faster inference)")
+    
+    # Quantization configuration
+    load_in_4bit = hasattr(cfg, 'load_in_4bit') and cfg.load_in_4bit
+    load_in_8bit = hasattr(cfg, 'load_in_8bit') and cfg.load_in_8bit
+    
+    quantization_config = None
+    if load_in_4bit or load_in_8bit:
+        try:
+            from transformers import BitsAndBytesConfig
+            if load_in_4bit:
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4"
+                )
+                print(f"✓ Using 4-bit quantization (NF4, double quant)")
+            elif load_in_8bit:
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+                print(f"✓ Using 8-bit quantization")
+        except ImportError:
+            print("⚠️  Quantization requested but bitsandbytes not installed")
+            print("   Install with: pip install bitsandbytes")
+            load_in_4bit = False
+            load_in_8bit = False
     
     # Load model - uses LOCAL registered classes instead of remote code
     vla = AutoModelForVision2Seq.from_pretrained(
@@ -152,24 +188,39 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         low_cpu_mem_usage=True,
         trust_remote_code=False,  # Use local code only!
         attn_implementation=attn_implementation,
+        quantization_config=quantization_config,
+        device_map="auto" if (load_in_4bit or load_in_8bit) else None,
     )
+    
+    # Verify attention implementation after loading
+    try:
+        if hasattr(vla, 'language_model') and hasattr(vla.language_model, 'model'):
+            first_layer = vla.language_model.model.layers[0]
+            if hasattr(first_layer, 'self_attn'):
+                attn_class = first_layer.self_attn.__class__.__name__
+                print(f"✓ Model loaded with attention: {attn_class}")
+    except:
+        pass
 
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
     vla.eval()
 
-    if not (hasattr(cfg, 'load_in_8bit') and cfg.load_in_8bit) and \
-       not (hasattr(cfg, 'load_in_4bit') and cfg.load_in_4bit):
-        vla = vla.to(DEVICE)
+    # Move to device only if not using quantization (quantization uses device_map)
+    if not load_in_4bit and not load_in_8bit:
+        device = torch.device(cfg.device)
+        vla = vla.to(device)
+    else:
+        print(f"✓ Model loaded with device_map='auto' (quantization enabled)")
 
-    _load_dataset_stats(vla, cfg.pretrained_checkpoint, use_local=use_local)
+    _load_dataset_stats(vla, cfg.pretrained_checkpoint)
     return vla
 
 
-def _load_dataset_stats(vla: torch.nn.Module, checkpoint_path: str, use_local: bool = True) -> None:
+def _load_dataset_stats(vla: torch.nn.Module, checkpoint_path: str) -> None:
     """Load dataset statistics for action normalization."""
-    resolved_path = resolve_model_path(checkpoint_path, use_local=use_local)
+    resolved_path = resolve_model_path(checkpoint_path)
     
-    if model_is_on_hf_hub(checkpoint_path, use_local=use_local):
+    if model_is_on_hf_hub(checkpoint_path):
         dataset_statistics_path = hf_hub_download(
             repo_id=checkpoint_path,
             filename="dataset_statistics.json",
@@ -203,7 +254,9 @@ def get_processor(cfg: Any) -> AutoProcessor:
 
 def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int, device: Optional[torch.device] = None, vla: Optional[torch.nn.Module] = None) -> ProprioProjector:
     """Get proprioception projector."""
-    target_device = device if device is not None else DEVICE
+    if device is None:
+        device = torch.device(cfg.proprio_projector_device)
+    target_device = device
     
     use_local = getattr(cfg, 'use_local', True)
     resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint, use_local=use_local)
@@ -259,7 +312,9 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int, device: Opti
 
 def get_action_head(cfg: Any, llm_dim: int, device: Optional[torch.device] = None, vla: Optional[torch.nn.Module] = None) -> L1RegressionActionHead:
     """Get L1 regression action head."""
-    target_device = device if device is not None else DEVICE
+    if device is None:
+        device = torch.device(cfg.action_head_device)
+    target_device = device
     
     use_local = getattr(cfg, 'use_local', True)
     resolved_checkpoint = resolve_model_path(cfg.pretrained_checkpoint, use_local=use_local)
@@ -345,6 +400,7 @@ def get_vla_action(
     proprio_projector: Optional[torch.nn.Module] = None,
 ) -> List[np.ndarray]:
     """Generate action predictions with VLA policy."""
+    device = torch.device(cfg.device)
     with torch.inference_mode():
         # Collect input images
         all_images = [obs["full_image"]]
@@ -359,12 +415,12 @@ def get_vla_action(
         prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
 
         # Process primary image
-        inputs = processor(prompt, primary_image).to(DEVICE, dtype=torch.bfloat16)
+        inputs = processor(prompt, primary_image).to(device, dtype=torch.bfloat16)
 
         # Process additional wrist images if any
         if all_images:
             all_wrist_inputs = [
-                processor(prompt, image_wrist).to(DEVICE, dtype=torch.bfloat16) for image_wrist in all_images
+                processor(prompt, image_wrist).to(device, dtype=torch.bfloat16) for image_wrist in all_images
             ]
             primary_pixel_values = inputs["pixel_values"]
             all_wrist_pixel_values = [wrist_inputs["pixel_values"] for wrist_inputs in all_wrist_inputs]

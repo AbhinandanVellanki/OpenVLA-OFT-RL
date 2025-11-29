@@ -715,18 +715,33 @@ class OpenVLAPPO:
         stats = defaultdict(list)
         
         # Multiple epochs of optimization
-        for epoch in tqdm(
+        epoch_pbar = tqdm(
             range(self.cfg.n_epochs),
             desc="Policy update",
             leave=False,
             ncols=100,
             bar_format='{l_bar}{bar}| Epoch {n_fmt}/{total_fmt}'
-        ):
+        )
+        
+        for epoch in epoch_pbar:
             # Generate random minibatch indices
             indices = torch.randperm(len(advantages))
             
+            # Calculate number of minibatches
+            num_minibatches = (len(advantages) + self.cfg.batch_size - 1) // self.cfg.batch_size
+            
+            # Progress bar for minibatches within epoch
+            minibatch_pbar = tqdm(
+                range(0, len(advantages), self.cfg.batch_size),
+                desc=f"  Epoch {epoch+1} minibatches",
+                leave=False,
+                ncols=100,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} batches',
+                total=num_minibatches
+            )
+            
             # Process minibatches
-            for start_idx in range(0, len(advantages), self.cfg.batch_size):
+            for start_idx in minibatch_pbar:
                 end_idx = min(start_idx + self.cfg.batch_size, len(advantages))
                 mb_indices = indices[start_idx:end_idx]
                 
@@ -817,8 +832,24 @@ class OpenVLAPPO:
                 stats['train/clipfrac'].append(total_clipfrac / n_samples)
                 stats['train/approx_kl'].append(total_approx_kl / n_samples)
                 
+                # Update minibatch progress bar with current stats
+                minibatch_pbar.set_postfix({
+                    'loss': f"{total_policy_loss / n_samples:.4f}",
+                    'clip': f"{total_clipfrac / n_samples:.3f}",
+                }, refresh=False)
+                
                 # Clear CUDA cache after each minibatch to prevent fragmentation
                 torch.cuda.empty_cache()
+            
+            minibatch_pbar.close()
+            
+            # Update epoch progress bar with average stats
+            epoch_pbar.set_postfix({
+                'avg_loss': f"{np.mean([s for s in stats['train/policy_loss'][-num_minibatches:]]):.4f}",
+                'avg_clip': f"{np.mean([s for s in stats['train/clipfrac'][-num_minibatches:]]):.3f}",
+            }, refresh=False)
+        
+        epoch_pbar.close()
         
         return {k: np.mean(v) for k, v in stats.items()}
     

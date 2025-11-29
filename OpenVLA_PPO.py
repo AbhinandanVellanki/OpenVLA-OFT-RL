@@ -644,6 +644,7 @@ class OpenVLAPPO:
                         action=action,
                         reward=sparse_reward,
                         done=done,
+                        value=0.0,  # GRPO mode: must provide value even if unused
                         old_log_prob=action_info['log_prob'],
                     )
                     

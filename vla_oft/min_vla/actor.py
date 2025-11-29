@@ -59,17 +59,32 @@ class OpenVLAActor:
         self.proprio_projector = None
         if cfg.use_proprio:
             llm_dim = self.vla.llm_dim   # defined in modeling_prismatic.OpenVLAForActionPrediction
-            # Libero spatial proprio dim is 8 (see constants or blog), but you can also infer
-            proprio_dim = 8 # 7 joints + gripper
+            # Use proprio_dim from config (default 8 for LIBERO)
+            proprio_dim = cfg.proprio_dim
             self.proprio_projector = openvla_utils.get_proprio_projector(
                 cfg, llm_dim=llm_dim, proprio_dim=proprio_dim, device=self.proprio_device, vla=self.vla
             )
+        
+        # Store config for later use
+        self.cfg = cfg
 
-        # 4) Load continuous action head on GPU 0
-        self.action_head = None
-        if cfg.use_l1_regression and not cfg.finetuned_on_discrete_actions:
+        # 4) Load L1 regression action head (optional, for supervised learning or comparison)
+        self.l1_action_head = None
+        if cfg.load_l1_action_head and not cfg.finetuned_on_discrete_actions:
             llm_dim = self.vla.llm_dim
-            self.action_head = openvla_utils.get_action_head(cfg, llm_dim=llm_dim, device=self.action_head_device, vla=self.vla)
+            self.l1_action_head = openvla_utils.get_action_head(cfg, llm_dim=llm_dim, device=self.action_head_device, vla=self.vla)
+            
+            if cfg.freeze_l1_action_head:
+                for param in self.l1_action_head.parameters():
+                    param.requires_grad = False
+                print("Loaded L1 regression action head (frozen)")
+            else:
+                print("Loaded L1 regression action head (trainable)")
+        else:
+            print("L1 regression action head disabled (using tokenized actions)")
+        
+        # Backward compatibility: expose as action_head for old code
+        self.action_head = self.l1_action_head
 
         self.state = OpenVLAActorState(
             vla=self.vla,
@@ -127,7 +142,24 @@ class OpenVLAActor:
         # Handle proprio on GPU 0 if needed
         proprio_tensor = None
         if proprio is not None and self.proprio_projector is not None:
+            # Clip proprio to expected dimension if needed
+            if len(proprio) > self.cfg.proprio_dim:
+                proprio = proprio[:self.cfg.proprio_dim]
+            elif len(proprio) < self.cfg.proprio_dim:
+                raise ValueError(
+                    f"Proprio dimension {len(proprio)} is less than expected {self.cfg.proprio_dim}. "
+                    f"Cannot pad - check observation processing."
+                )
             proprio_tensor = torch.from_numpy(proprio).to(self.proprio_device, dtype=torch.float32)
+        elif proprio is not None:
+            # Clip proprio even if no projector (for consistency)
+            if len(proprio) > self.cfg.proprio_dim:
+                proprio = proprio[:self.cfg.proprio_dim]
+            elif len(proprio) < self.cfg.proprio_dim:
+                raise ValueError(
+                    f"Proprio dimension {len(proprio)} is less than expected {self.cfg.proprio_dim}. "
+                    f"Cannot pad - check observation processing."
+                )
 
         # 2) Call VLA's predict_action API (defined in modeling_prismatic)
         # VLA on GPU 1, will handle cross-GPU transfers internally
@@ -139,7 +171,7 @@ class OpenVLAActor:
             action_head=self.action_head,
             pixel_values=pixel_values,
             attention_mask=attention_mask,
-            use_film=False,  # FiLM is for critic in VLA-RL, not for actor
+            use_film=False,  # Model not trained with FiLM conditioning
         )
 
         # actions is numpy array shape (NUM_ACTIONS_CHUNK, ACTION_DIM)

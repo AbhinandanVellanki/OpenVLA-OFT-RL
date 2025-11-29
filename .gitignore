@@ -1,12 +1,14 @@
-__pycache__/
-*/__pycache__/
-.pytest_cache/
+
+**/__pycache__/
+**/.pytest_cache/
 .DS_Store
 
 *.pth
 *.pt
 *.ckpt
-checkpoints/
-models/
+checkpoints
+models
 
 libero_observations 
+**.pid
+wandb/*

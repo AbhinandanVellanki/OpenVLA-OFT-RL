@@ -19,8 +19,8 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
-from rollout_buffer import RolloutBuffer
-from dummy_policy import DummyPolicy
+from ppo.rollout_buffer import RolloutBuffer
+from ppo.dummy_policy import DummyPolicy
 
 
 class PPOTrainer:

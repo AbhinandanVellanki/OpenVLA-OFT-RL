@@ -6,11 +6,19 @@ from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_I
 
 
 def get_current_action_mask(token_ids):
+    # Handle None case
+    if token_ids is None:
+        raise ValueError("token_ids cannot be None")
+    
+    # Ensure token_ids is a tensor
+    if not isinstance(token_ids, torch.Tensor):
+        token_ids = torch.tensor(token_ids)
+    
     # Create a tensor marking positions of IGNORE_INDEX
     newline_positions = token_ids != IGNORE_INDEX
 
     # Calculate cumulative sum to identify regions between newlines
-    cumsum = torch.cumsum(newline_positions, dim=1)
+    cumsum = torch.cumsum(newline_positions.to(torch.int32), dim=1)
 
     # Create the mask
     mask = (1 <= cumsum) & (cumsum <= ACTION_DIM)
@@ -23,11 +31,19 @@ def get_current_action_mask(token_ids):
 
 
 def get_next_actions_mask(token_ids):
+    # Handle None case
+    if token_ids is None:
+        raise ValueError("token_ids cannot be None")
+    
+    # Ensure token_ids is a tensor
+    if not isinstance(token_ids, torch.Tensor):
+        token_ids = torch.tensor(token_ids)
+    
     # Create a tensor marking positions of IGNORE_INDEX
     newline_positions = token_ids != IGNORE_INDEX
 
     # Calculate cumulative sum to identify regions between newlines
-    cumsum = torch.cumsum(newline_positions, dim=1)
+    cumsum = torch.cumsum(newline_positions.to(torch.int32), dim=1)
 
     # Create the mask
     mask = cumsum > ACTION_DIM

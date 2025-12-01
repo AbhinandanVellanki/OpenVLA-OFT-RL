@@ -15,9 +15,9 @@ class OpenVLAActorConfig:
     use_local: bool = True
 
     # GPU configuration
-    use_multi_gpu: bool = False  # Enable to split model across GPUs
-    gpu_id: int = 0  # Primary GPU for VLA backbone (vision + language model)
-    secondary_gpu_id: int = 1  # Secondary GPU for training components (action head, value head, gradients)
+    use_multi_gpu: bool = True  # Enable to split model across GPUs
+    gpu_id: int = 1  # Primary GPU for VLA backbone (vision + language model)
+    secondary_gpu_id: int = 0  # Secondary GPU for training components (action head, value head, gradients)
     
     """
     Multi-GPU Memory Distribution Strategy:

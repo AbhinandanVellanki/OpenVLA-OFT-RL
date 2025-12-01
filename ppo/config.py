@@ -24,7 +24,7 @@ class PPOConfig:
     Typical values: 50k-1M for single task, 500k-5M for multi-task.
     """
     
-    n_steps: int = 1000
+    n_steps: int = 10
     """Number of environment steps to collect before each policy update (rollout length).
     This is NOT the episode length - episodes can span multiple updates.
     - Higher values (500-2048): More stable gradients, slower updates, better for complex tasks
@@ -40,7 +40,7 @@ class PPOConfig:
     Must divide evenly into n_steps for best results.
     """
     
-    n_epochs: int = 10
+    n_epochs: int = 1
     """Number of passes through the collected data during each policy update.
     Each update, we iterate over the n_steps buffer this many times.
     - Higher epochs (10-20): More learning per sample, risk of overfitting
@@ -61,7 +61,7 @@ class PPOConfig:
     """
     
     critic_lr: float = 3e-4
-    """Learning rate for the critic (value head network).
+    """Learning rate for the critic (value head network)
     Can be higher than actor since value head trains from scratch.
     - 1e-4 to 5e-4: Standard range for critic learning
     - 3e-4: Default value used in many RL implementations
@@ -191,7 +191,7 @@ class PPOConfig:
     Set to 0 to disable validation during training.
     """
     
-    val_episodes: int = 10
+    val_episodes: int = 1
     """Number of episodes to run during each validation phase.
     More episodes give better success rate estimates but take longer.
     - 5-10: Quick validation
@@ -203,7 +203,7 @@ class PPOConfig:
     # Logging and Checkpointing
     # ===========================================
     
-    use_wandb: bool = False
+    use_wandb: bool = True
     """Enable Weights & Biases logging for experiment tracking.
     Logs metrics like reward, success rate, value loss to wandb dashboard.
     Set to False to disable (useful for quick tests).

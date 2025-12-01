@@ -12,7 +12,9 @@ nohup bash -c '
     # Activate conda
     source ~/miniconda3/etc/profile.d/conda.sh
     conda activate oft_rl
-    export CUDA_VISIBLE_DEVICES=0
+    
+    # Enable expandable memory segments to handle fragmentation
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     
     # Run PPO training with wandb logging
     python OpenVLA_PPO.py \

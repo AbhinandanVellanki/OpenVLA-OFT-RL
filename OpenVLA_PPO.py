@@ -706,10 +706,11 @@ class OpenVLAPPO:
             return {"train/no_data": 1.0}
         
         # Keep data on rollout device initially
-        advantages = torch.FloatTensor(data["advantages"]).to(self.device)
-        returns = torch.FloatTensor(data["returns"]).to(self.device)
-        old_log_probs = data["old_log_probs"].to(self.device)
-        responses = data["responses"].to(self.device)
+        # Move all data tensors to training_device for safe indexing
+        advantages = torch.FloatTensor(data["advantages"]).to(self.training_device)
+        returns = torch.FloatTensor(data["returns"]).to(self.training_device)
+        old_log_probs = data["old_log_probs"].to(self.training_device)
+        responses = data["responses"].to(self.training_device)
         
         # Training statistics
         stats = defaultdict(list)
@@ -745,6 +746,8 @@ class OpenVLAPPO:
                 end_idx = min(start_idx + self.cfg.batch_size, len(advantages))
                 mb_indices = indices[start_idx:end_idx]
                 
+                # Ensure all minibatch tensors are on training_device
+                # mb_indices must remain on CPU for indexing
                 mb_advantages = advantages[mb_indices]
                 mb_old_log_probs = old_log_probs[mb_indices]
                 mb_responses = responses[mb_indices]
@@ -786,7 +789,9 @@ class OpenVLAPPO:
                     # Map response tokens to indices in [0, 255]
                     response_indices = response - (self.action_tokenizer.vocab_size - 256)
                     
-                    # Compute log prob from logits
+                    # Ensure logits and response_indices are on the same device
+                    logits = logits.to(self.training_device)
+                    response_indices = response_indices.to(self.training_device)
                     log_prob = logprobs_from_logits(logits.unsqueeze(0), response_indices.unsqueeze(0))
                     log_prob = log_prob.sum()  # Sum over action dimensions
                     
@@ -850,7 +855,7 @@ class OpenVLAPPO:
             }, refresh=False)
         
         epoch_pbar.close()
-        
+        # ...existing code...
         return {k: np.mean(v) for k, v in stats.items()}
     
     def validate(self, env, task_prompt: str) -> Dict[str, float]:
@@ -859,7 +864,20 @@ class OpenVLAPPO:
         
         Uses greedy (argmax) action selection for deterministic evaluation.
         """
+        # Set to eval mode first
         self.actor.vla.eval()
+        if self.actor.l1_action_head is not None:
+            self.actor.l1_action_head.eval()
+        
+        # Aggressive memory cleanup before validation to prevent OOM
+        import gc
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
         
         val_rewards = []
         val_successes = []
@@ -901,6 +919,17 @@ class OpenVLAPPO:
             
             val_rewards.append(episode_reward)
             val_successes.append(float(info.get("success", False)))
+            
+            # Clear cache frequently during validation to prevent memory buildup
+            if (ep + 1) % 2 == 0:  # Every 2 episodes
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        
+        # Final cleanup after validation
+        import gc
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
         
         return {
             "val/mean_reward": np.mean(val_rewards),

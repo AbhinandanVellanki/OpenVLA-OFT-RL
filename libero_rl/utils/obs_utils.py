@@ -4,8 +4,9 @@ Observation utilities for LIBERO environments.
 Provides functions to extract and preprocess observations from LIBERO environments.
 """
 
+import math
 import numpy as np
-from typing import Dict, Any, Optional, Tuple, Union
+from typing import Dict, Any, Optional, Tuple, Union, List
 from PIL import Image
 
 
@@ -42,6 +43,94 @@ def get_image_from_obs(
         img = img[::-1, ::-1]
     
     return img.astype(np.uint8)
+
+
+def quat2axisangle(quat: np.ndarray) -> np.ndarray:
+    """
+    Convert quaternion to axis-angle format.
+    
+    Copied from robosuite to match the high-success evaluation codebase.
+    Returns a unit vector direction scaled by its angle in radians.
+    
+    Args:
+        quat: (x,y,z,w) vec4 float angles
+    
+    Returns:
+        np.array: (ax,ay,az) axis-angle exponential coordinates
+    """
+    # Clip quaternion
+    if quat[3] > 1.0:
+        quat[3] = 1.0
+    elif quat[3] < -1.0:
+        quat[3] = -1.0
+
+    den = np.sqrt(1.0 - quat[3] * quat[3])
+    if math.isclose(den, 0.0):
+        # This is (close to) a zero degree rotation, immediately return
+        return np.zeros(3)
+
+    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
+
+
+def get_wrist_image_from_obs(obs: Dict[str, Any], rotate: bool = True) -> np.ndarray:
+    """
+    Extract wrist camera image from LIBERO observation dictionary.
+    
+    Args:
+        obs: Observation dictionary from LIBERO environment
+        rotate: Whether to rotate image 180 degrees (default True for VLA compatibility)
+        
+    Returns:
+        Wrist image array of shape (H, W, 3), dtype uint8
+    """
+    return get_image_from_obs(obs, camera_name="robot0_eye_in_hand", rotate=rotate)
+
+
+def get_proprio_state_for_vla(obs: Dict[str, Any]) -> np.ndarray:
+    """
+    Extract 8D proprio state in the exact format expected by OpenVLA-OFT models.
+    
+    This matches the format from the high-success evaluation codebase:
+    - End-effector position (3D)
+    - End-effector orientation as axis-angle (3D)  
+    - Gripper joint positions (2D)
+    
+    Total: 8 dimensions
+    
+    Args:
+        obs: Observation dictionary from LIBERO environment
+        
+    Returns:
+        Proprio state array of shape (8,)
+    """
+    state_parts = []
+    
+    # End-effector position (3D)
+    if "robot0_eef_pos" in obs:
+        state_parts.append(obs["robot0_eef_pos"])
+    else:
+        raise KeyError("robot0_eef_pos not found in observation")
+    
+    # End-effector orientation as axis-angle (3D)
+    if "robot0_eef_quat" in obs:
+        quat = obs["robot0_eef_quat"]
+        axis_angle = quat2axisangle(quat)
+        state_parts.append(axis_angle)
+    else:
+        raise KeyError("robot0_eef_quat not found in observation")
+    
+    # Gripper joint positions (2D)
+    if "robot0_gripper_qpos" in obs:
+        state_parts.append(obs["robot0_gripper_qpos"])
+    else:
+        raise KeyError("robot0_gripper_qpos not found in observation")
+    
+    proprio_state = np.concatenate(state_parts).astype(np.float32)
+    
+    # Verify shape
+    assert proprio_state.shape == (8,), f"Expected 8D proprio state, got {proprio_state.shape}"
+    
+    return proprio_state
 
 
 def get_robot_state_from_obs(obs: Dict[str, Any]) -> np.ndarray:
@@ -148,9 +237,15 @@ def process_observation_for_vla(
     resize_size: Tuple[int, int] = (224, 224),
     center_crop: bool = True,
     crop_scale: float = 0.9,
-) -> Dict[str, Any]:
+    num_images: int = 1,
+    use_wrist_camera: bool = False,
+    return_pil: bool = False,
+) -> Dict[str, Union[np.ndarray, List[np.ndarray]]]:
     """
     Process LIBERO observation for VLA model input.
+    
+    This function matches the preprocessing from the high-success evaluation codebase,
+    including proper image rotation, multi-camera support, and axis-angle proprio format.
     
     Args:
         obs: Raw observation dictionary from LIBERO
@@ -158,13 +253,18 @@ def process_observation_for_vla(
         resize_size: Target image size
         center_crop: Whether to apply center cropping
         crop_scale: Center crop scale factor
+        num_images: Number of images to include (1 or 2)
+        use_wrist_camera: Whether to include wrist camera image
+        return_pil: If True, return PIL Images (required for VLA processor)
         
     Returns:
         Processed observation dictionary with:
-            - "image": Preprocessed image (H, W, 3)
-            - "robot_state": Robot proprioceptive state
+            - "image": Single PIL Image or list of PIL Images for multi-camera
+            - "proprio": 8D proprio state (eef_pos, axis_angle, gripper_qpos)
     """
-    # Extract and process image
+    from PIL import Image as PILImage
+    
+    # Extract and process primary image
     img = get_image_from_obs(obs, camera_name=camera_name, rotate=True)
     
     if center_crop:
@@ -172,13 +272,40 @@ def process_observation_for_vla(
     
     img = preprocess_image(img, resize_size=resize_size)
     
-    # Extract robot state
-    robot_state = get_robot_state_from_obs(obs)
+    # Collect images
+    images = [img]
     
-    return {
-        "image": img,
-        "robot_state": robot_state,
+    # Handle multi-image input (agentview + wrist)
+    if num_images == 2 or use_wrist_camera:
+        wrist_img = get_wrist_image_from_obs(obs, rotate=True)
+        
+        if center_crop:
+            wrist_img = center_crop_image(wrist_img, crop_scale=crop_scale)
+        
+        wrist_img = preprocess_image(wrist_img, resize_size=resize_size)
+        images.append(wrist_img)
+    
+    # Extract proprio state in VLA format (8D with axis-angle)
+    proprio_state = get_proprio_state_for_vla(obs)
+    
+    # Convert to PIL if requested
+    if return_pil:
+        if num_images > 1:
+            # Return list of PIL Images for multi-camera
+            final_image = [PILImage.fromarray(im.astype(np.uint8)) for im in images]
+        else:
+            # Return single PIL Image
+            final_image = PILImage.fromarray(images[0].astype(np.uint8))
+    else:
+        # Return numpy arrays
+        final_image = images[0] if num_images == 1 else images
+    
+    processed_obs = {
+        "image": final_image,
+        "proprio": proprio_state,
     }
+    
+    return processed_obs
 
 
 def stack_observations(obs_list: list) -> Dict[str, np.ndarray]:

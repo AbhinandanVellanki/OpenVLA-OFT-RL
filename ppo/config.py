@@ -191,7 +191,7 @@ class PPOConfig:
     Set to 0 to disable validation during training.
     """
     
-    val_episodes: int = 1
+    val_episodes: int = 20
     """Number of episodes to run during each validation phase.
     More episodes give better success rate estimates but take longer.
     - 5-10: Quick validation

@@ -299,12 +299,12 @@ class OpenVLAActorConfig:
     # Vision Input Configuration
     # ===========================================
     
-    num_images_in_input: int = 1
+    num_images_in_input: int = 2
     """Number of RGB images to use as input.
     
-    OpenVLA processes one RGB camera view at a time.
-    - 1: Single camera (standard for LIBERO agentview)
-    - Multi-camera support not implemented yet
+    OpenVLA processes RGB camera views for action prediction.
+    - 1: Single camera (agentview only) - used for training to save memory
+    - 2: Multi-camera (agentview + wrist camera) - REQUIRED for pretrained model
     
     Each image is resized to 224x224 and processed by the vision backbone
     (SigLIP-400M) to extract 256 patch embeddings.

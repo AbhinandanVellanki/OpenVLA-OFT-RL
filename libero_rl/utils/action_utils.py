@@ -231,3 +231,29 @@ def delta_pose_to_action(
         delta_rot,
         [gripper],
     ]).astype(np.float32)
+
+
+def process_action_for_libero(action: np.ndarray) -> np.ndarray:
+    """
+    Process action for LIBERO environment execution.
+    
+    Applies both gripper normalization and sign inversion to match the
+    high-success evaluation codebase.
+    
+    This function:
+    1. Normalizes gripper from [0,1] to [-1,+1] and binarizes to {-1, +1}
+    2. Inverts gripper sign for OpenVLA models (0=close, 1=open -> -1=open, +1=close)
+    
+    Args:
+        action: Raw action from VLA model (7D: xyz, rpy, gripper)
+    
+    Returns:
+        Processed action ready for LIBERO environment
+    """
+    # Step 1: Normalize gripper from [0,1] to [-1,+1] and binarize
+    action = normalize_gripper_action(action, binarize=True)
+    
+    # Step 2: Invert gripper sign for OpenVLA models
+    action = invert_gripper_action(action)
+    
+    return action

@@ -174,13 +174,46 @@ class TrajectoryBuffer:
             traj['returns'] = returns
             traj['advantages'] = advantages
         
-        # Normalize advantages across all trajectories
+        # Normalize advantages across all trajectories with robust NaN/inf handling
         all_advantages = np.concatenate([t['advantages'] for t in self.trajectories])
-        adv_mean = all_advantages.mean()
-        adv_std = all_advantages.std() + 1e-8
         
-        for traj in self.trajectories:
-            traj['advantages'] = (traj['advantages'] - adv_mean) / adv_std
+        # Check for NaN or inf in advantages
+        if np.any(np.isnan(all_advantages)) or np.any(np.isinf(all_advantages)):
+            print(f"⚠️  WARNING: Found NaN or inf in advantages before normalization!")
+            print(f"   NaN count: {np.isnan(all_advantages).sum()}")
+            print(f"   Inf count: {np.isinf(all_advantages).sum()}")
+            # Replace NaN/inf with zeros
+            all_advantages = np.nan_to_num(all_advantages, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        adv_mean = all_advantages.mean()
+        adv_std = all_advantages.std()
+        
+        # Debug: Print advantage statistics
+        print(f"\n📊 Advantage Statistics:")
+        print(f"   Mean: {adv_mean:.6f}")
+        print(f"   Std: {adv_std:.6f}")
+        print(f"   Min: {all_advantages.min():.6f}")
+        print(f"   Max: {all_advantages.max():.6f}")
+        print(f"   Total samples: {len(all_advantages)}")
+        
+        # CRITICAL: If all advantages are identical (e.g., all successes), std will be 0
+        # In this case, DON'T normalize - just use raw advantages
+        if adv_std < 1e-6:
+            print(f"⚠️  WARNING: All advantages are nearly identical (std={adv_std:.2e})")
+            print(f"   Skipping normalization to prevent gradient issues.")
+            print(f"   Using raw advantages: mean={adv_mean:.6f}")
+            # Don't normalize - keep original advantages
+        else:
+            # Normal case: normalize advantages
+            adv_std = adv_std + 1e-8
+            
+            for traj in self.trajectories:
+                traj['advantages'] = (traj['advantages'] - adv_mean) / adv_std
+                
+                # Final safety check after normalization
+                if np.any(np.isnan(traj['advantages'])) or np.any(np.isinf(traj['advantages'])):
+                    print(f"⚠️  ERROR: NaN/inf in advantages after normalization! Setting to zeros.")
+                    traj['advantages'] = np.nan_to_num(traj['advantages'], nan=0.0, posinf=0.0, neginf=0.0)
     
     def get(self) -> Dict[str, Any]:
         """

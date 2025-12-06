@@ -55,7 +55,7 @@ class OpenVLAActor:
         # 2) Load HF processor (handles tokenization + image preprocessing)
         self.processor = openvla_utils.get_processor(cfg)
 
-        # 3) Load proprio projector (if using proprio) on GPU 0
+        # 3) Load proprio projector (if using proprio)
         self.proprio_projector = None
         if cfg.use_proprio:
             llm_dim = self.vla.llm_dim   # defined in modeling_prismatic.OpenVLAForActionPrediction
@@ -64,6 +64,12 @@ class OpenVLAActor:
             self.proprio_projector = openvla_utils.get_proprio_projector(
                 cfg, llm_dim=llm_dim, proprio_dim=proprio_dim, device=self.proprio_device, vla=self.vla
             )
+            # ENFORCE: Move to correct device if VLA model loaded it elsewhere
+            if hasattr(self.vla, 'proprio_projector') and self.vla.proprio_projector is not None:
+                current_device = next(self.vla.proprio_projector.parameters()).device
+                if current_device != self.proprio_device:
+                    print(f"⚠️  Moving VLA's proprio_projector from {current_device} to {self.proprio_device}")
+                    self.vla.proprio_projector = self.vla.proprio_projector.to(self.proprio_device)
         
         # Store config for later use
         self.cfg = cfg
@@ -73,6 +79,13 @@ class OpenVLAActor:
         if cfg.load_l1_action_head and not cfg.finetuned_on_discrete_actions:
             llm_dim = self.vla.llm_dim
             self.l1_action_head = openvla_utils.get_action_head(cfg, llm_dim=llm_dim, device=self.action_head_device, vla=self.vla)
+            
+            # ENFORCE: Move to correct device if VLA model loaded it elsewhere
+            if hasattr(self.vla, 'action_head') and self.vla.action_head is not None:
+                current_device = next(self.vla.action_head.parameters()).device
+                if current_device != self.action_head_device:
+                    print(f"⚠️  Moving VLA's action_head from {current_device} to {self.action_head_device}")
+                    self.vla.action_head = self.vla.action_head.to(self.action_head_device)
             
             if cfg.freeze_l1_action_head:
                 for param in self.l1_action_head.parameters():

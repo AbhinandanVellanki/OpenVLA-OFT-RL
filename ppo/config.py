@@ -57,10 +57,13 @@ class PPOConfig:
     # PPO Algorithm Hyperparameters
     # ===========================================
     
-    actor_lr: float = 1e-5
+    actor_lr: float = 1e-6
     """Learning rate for the actor (VLA policy network).
     Lower than standard RL due to fine-tuning a pretrained 7B model.
-    - 1e-5 to 1e-6: Conservative, prevents catastrophic forgetting
+    - 5e-7: Ultra-conservative, prevents gradient explosions even with mean log probs
+    - 1e-6: Very conservative, prevents massive gradient explosions with 7B LoRA
+    - 5e-6: Conservative, prevents NaN losses
+    - 1e-5: Moderate, prevents catastrophic forgetting
     - 1e-4 to 3e-4: Standard RL, use only if training from scratch
     Adam optimizer is used for both actor and critic.
     """
@@ -129,21 +132,25 @@ class PPOConfig:
     Formula: L_total = L_policy - c1*L_value + c2*H(policy)
     """
     
-    max_grad_norm: float = 0.5
+    max_grad_norm: float = 1.0
     """Maximum gradient norm for gradient clipping.
     Prevents exploding gradients during training.
+    - 0.05: Ultra-tight, prevents any gradient explosions (7B LoRA with sparse rewards)
+    - 0.1: Very conservative, prevents massive gradient explosions
+    - 0.3: Conservative, prevents NaN losses (recommended for 7B models)
     - 0.5: Standard for large models (7B parameters)
     - 1.0: Standard for smaller models
-    - 0.1-0.3: More conservative, use if seeing NaN losses
     Applied via torch.nn.utils.clip_grad_norm_().
     """
     
-    rollout_temperature: float = 1.6
+    rollout_temperature: float = 1.0
     """Temperature for action sampling during rollout collection.
     Higher temperature = more exploration.
-    - 1.6: Reference setting from SimpleVLA-RL
-    - 1.0: Standard softmax sampling
+    - 1.0: Standard softmax sampling (better balance)
+    - 1.6: High exploration (original, but too random for learning)
     - 0.0: Greedy (argmax) selection
+    
+    Reduced from 1.6 to 1.0 to reduce action randomness and improve success rate.
     """
     
     eval_temperature: float = 0.0

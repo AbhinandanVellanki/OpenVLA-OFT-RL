@@ -15,8 +15,8 @@ class OpenVLAActorConfig:
     use_local: bool = True
 
     # GPU configuration
-    use_multi_gpu: bool = True  # Enable to split model across GPUs
-    gpu_id: int = 0  # Primary GPU for VLA backbone (vision + language model)
+    use_multi_gpu: bool = False  # Enable to split model across GPUs
+    gpu_id: int = 1  # Primary GPU for VLA backbone (vision + language model)
     secondary_gpu_id: int = 1  # Secondary GPU for training components (action head, value head, gradients)
     
     """
@@ -105,7 +105,7 @@ class OpenVLAActorConfig:
     # Training Configuration
     # ===========================================
     
-    freeze_vla_backbone: bool = False
+    freeze_vla_backbone: bool = True
     """Freeze VLA backbone (vision + language model) during training.
     
     IMPORTANT: With LoRA enabled, gradients exist on BOTH GPUs:

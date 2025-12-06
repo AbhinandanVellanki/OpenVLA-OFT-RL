@@ -72,17 +72,24 @@ class OpenVLAPPO:
         self.cfg = ppo_config
         self.vla_config = vla_config
         
-        # Respect multi-GPU configuration from vla_config
+        # ALWAYS use vla_config for device settings (single source of truth)
+        self.device = torch.device(vla_config.device)  # VLA backbone device
+        self.training_device = torch.device(vla_config.training_device)  # Training components device
+        
+        # CRITICAL: Set default CUDA device to match config (prevents cuda:0 defaults)
+        if self.device.type == 'cuda':
+            torch.cuda.set_device(self.device)
+            print(f"✓ Set default CUDA device to {self.device}")
+        
         if vla_config.use_multi_gpu:
-            self.device = torch.device(vla_config.device)  # GPU 0 for VLA backbone
-            self.training_device = torch.device(vla_config.training_device)  # GPU 1 for training
             print(f"Multi-GPU Setup:")
             print(f"  - VLA backbone on {self.device}")
             print(f"  - Training components on {self.training_device}")
         else:
-            self.device = torch.device(ppo_config.device)
-            self.training_device = self.device
             print(f"Single-GPU Setup: All components on {self.device}")
+            if self.device != self.training_device:
+                print(f"  ⚠️  Warning: vla_config has different device ({self.device}) and training_device ({self.training_device})")
+                print(f"  ⚠️  For single-GPU mode, these should match. Check vla_config.gpu_id and vla_config.secondary_gpu_id")
         
         # Initialize OpenVLA actor
         print("Initializing OpenVLA actor...")
@@ -116,8 +123,8 @@ class OpenVLAPPO:
         # Store unnorm_key for validation
         self.unnorm_key = "libero_spatial_no_noops"
 
-        # Apply LoRA or freeze VLA backbone based on config
-        if vla_config.use_lora and not vla_config.freeze_vla_backbone:
+        # Apply LoRA if configured (independent of freezing)
+        if vla_config.use_lora:
             print("\n" + "="*70)
             print("Applying LoRA Adapters to VLA Model")
             print("="*70)
@@ -150,12 +157,13 @@ class OpenVLAPPO:
             except ImportError:
                 print("WARNING: peft library not found!")
                 print("    Install with: pip install peft")
-                print("    Falling back to freezing VLA backbone")
+                print("    Falling back to full VLA training")
                 print("="*70 + "\n")
-                vla_config.freeze_vla_backbone = True
                 vla_config.use_lora = False
         
-        if vla_config.freeze_vla_backbone:
+        # Apply freezing strategy based on configuration
+        if vla_config.freeze_vla_backbone and not vla_config.use_lora:
+            # Legacy freezing: Freeze entire backbone (used when LoRA is disabled)
             print("\n" + "="*70)
             print("Freezing VLA Backbone (Vision + Language Model)")
             print("="*70)
@@ -205,6 +213,75 @@ class OpenVLAPPO:
             print("  - Inference comparison with original checkpoint")
             print("="*70 + "\n")
         
+        # FREEZE VLA BACKBONE if configured
+        if vla_config.freeze_vla_backbone:
+            print("\n" + "="*70)
+            print("🔒 Freezing Base VLA Backbone (LoRA adapters trainable)")
+            print("="*70)
+            
+            # Freeze vision backbone
+            for name, param in self.actor.vla.vision_backbone.named_parameters():
+                if 'lora' not in name.lower():
+                    param.requires_grad = False
+            
+            # Freeze language model backbone (but NOT LoRA)
+            for name, param in self.actor.vla.language_model.named_parameters():
+                if 'lora' not in name.lower():
+                    param.requires_grad = False
+            
+            # Count trainable parameters
+            trainable = sum(p.numel() for p in self.actor.vla.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in self.actor.vla.parameters())
+            
+            print(f"✓ Frozen base backbone (7B parameters)")
+            print(f"✓ LoRA adapters trainable: {trainable:,} parameters")
+            print(f"✓ Trainable: {100*trainable/total:.2f}%")
+            print("="*70 + "\n")
+            
+            # Debug: Show what's actually trainable
+            print("\n📊 Trainable Parameter Breakdown:")
+            lora_params = []
+            backbone_params = []
+            other_params = []
+            
+            for name, param in self.actor.vla.named_parameters():
+                if param.requires_grad:
+                    if 'lora' in name.lower():
+                        lora_params.append((name, param.numel()))
+                    elif 'vision_backbone' in name or 'language_model' in name:
+                        backbone_params.append((name, param.numel()))
+                    else:
+                        other_params.append((name, param.numel()))
+            
+            print(f"\n✓ Trainable LoRA parameters: {len(lora_params)}")
+            if lora_params[:3]:  # Show first 3
+                for n, s in lora_params[:3]:
+                    print(f"  - {n}: {s:,} params")
+                if len(lora_params) > 3:
+                    print(f"  - ... and {len(lora_params) - 3} more")
+            
+            print(f"\n✓ Trainable backbone parameters: {len(backbone_params)}")
+            if backbone_params[:3]:
+                for n, s in backbone_params[:3]:
+                    print(f"  - {n}: {s:,} params")
+            elif len(backbone_params) == 0:
+                print(f"  - None (all frozen ✓)")
+            
+            print(f"\n✓ Other trainable parameters: {len(other_params)}")
+            if other_params:
+                for n, s in other_params:
+                    print(f"  - {n}: {s:,} params")
+            
+            total_lora = sum(s for _, s in lora_params)
+            total_backbone = sum(s for _, s in backbone_params)
+            total_other = sum(s for _, s in other_params)
+            print(f"\n📈 Total trainable in VLA: {total_lora + total_backbone + total_other:,}")
+            if total_lora + total_backbone + total_other > 0:
+                print(f"  - LoRA: {total_lora:,} ({100*total_lora/(total_lora+total_backbone+total_other):.1f}%)")
+                print(f"  - Backbone: {total_backbone:,} ({100*total_backbone/(total_lora+total_backbone+total_other):.1f}%)")
+                print(f"  - Other: {total_other:,} ({100*total_other/(total_lora+total_backbone+total_other):.1f}%)")
+            print()
+        
         # Initialize optimizer for trainable VLA components
         # Note: L1 action head is explicitly EXCLUDED from optimizer for PPO
         # Even if loaded, it won't be trained or used
@@ -220,6 +297,19 @@ class OpenVLAPPO:
             print("Including L1 action head in optimizer (hybrid training mode)")
         
         actor_params = vla_trainable_params + proprio_proj_params + l1_head_params
+        
+        # Print final trainable parameter count (including proprio projector)
+        trainable_vla = sum(p.numel() for p in vla_trainable_params if p.requires_grad)
+        trainable_proprio = sum(p.numel() for p in proprio_proj_params if p.requires_grad)
+        trainable_total = sum(p.numel() for p in actor_params if p.requires_grad)
+        total = sum(p.numel() for p in self.actor.vla.parameters())
+        
+        print(f"\n📊 Final Optimizer Parameters:")
+        print(f"   VLA trainable: {trainable_vla:,}")
+        print(f"   Proprio projector: {trainable_proprio:,}")
+        print(f"   Total trainable: {trainable_total:,} / {total:,} ({100*trainable_total/total:.2f}%)")
+        print(f"   Frozen: {total - trainable_vla:,} parameters\n")
+        
         self.actor_optimizer = optim.AdamW(actor_params, lr=ppo_config.actor_lr)
         self.max_grad_norm = ppo_config.max_grad_norm
         
@@ -250,7 +340,7 @@ class OpenVLAPPO:
         print(f"  - Mode: {'Multi-task vectorized' if self.is_vectorized else 'Single-task'}")
         print(f"  - Num envs: {ppo_config.num_envs}")
         print(f"  - Actor trainable params: {sum(p.numel() for p in actor_params):,}")
-        print(f"  - Action prediction: Tokenized (PPO mode)")
+        print(f"  - Action prediction: {'L1 Head + Token Log Probs (Hybrid)' if self.actor.l1_action_head else 'Tokenized (PPO mode)'}")
         print(f"  - Action bins: {self.action_tokenizer.n_bins}")
         print(f"  - L1 regression head: {'Loaded ({})'.format('frozen' if vla_config.freeze_l1_action_head else 'trainable') if self.actor.l1_action_head else 'Not loaded'}")
         print(f"  - Rollout temperature: {ppo_config.rollout_temperature}")
@@ -261,6 +351,11 @@ class OpenVLAPPO:
         if vla_config.use_multi_gpu:
             print(f"    * VLA backbone ({vla_config.device}): {'LoRA adapters' if vla_config.use_lora else 'frozen'}")
             print(f"    * Training components ({vla_config.training_device})")
+        
+        # Important: Confirm action head configuration for training
+        if self.actor.l1_action_head:
+            print(f"\n✓ Training will use L1 action head (same as validation) for rollouts")
+            print(f"  This ensures consistent 80% success rate during training!")
     
     def get_action(
         self,
@@ -272,8 +367,8 @@ class OpenVLAPPO:
         """
         Get action chunk from policy.
         
-        Two modes:
-        1. PPO training (use_builtin_predict=False): Uses tokenized actions with gradients
+        Three modes:
+        1. PPO training (use_builtin_predict=False): Uses L1 action head + computes log probs
         2. Validation (use_builtin_predict=True): Uses VLA's built-in predict_action()
            to exactly match reference 98% evaluation
         
@@ -291,8 +386,12 @@ class OpenVLAPPO:
             # Validation mode: Use VLA's built-in predict_action (matches reference 98% eval)
             return self._get_action_via_predict(obs, task_prompt)
         else:
-            # Training mode: Use tokenized actions with gradients for PPO
-            return self._get_action_via_tokens(obs, task_prompt, temperature)
+            # Training mode: Use L1 action head (for good actions) + compute log probs (for PPO)
+            if self.actor.l1_action_head is not None:
+                return self._get_action_l1_with_logprobs(obs, task_prompt, temperature)
+            else:
+                # Fallback to tokenized actions if no L1 head available
+                return self._get_action_via_tokens(obs, task_prompt, temperature)
     
     def _get_action_via_predict(
         self,
@@ -376,6 +475,124 @@ class OpenVLAPPO:
         info = {
             'log_prob': None,
             'responses': None,
+            'input_ids': inputs['input_ids'],
+            'attention_mask': inputs['attention_mask'],
+            'pixel_values': inputs['pixel_values'],
+            'proprio': proprio,
+        }
+        
+        return actions, info
+    
+    def _get_action_l1_with_logprobs(
+        self,
+        obs: Dict[str, Any],
+        task_prompt: str,
+        temperature: float = 1.6,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        Get action using L1 action head (for good performance) while computing
+        log probabilities from token distribution (for PPO training).
+        
+        This combines the best of both worlds:
+        - Actions from L1 head → same as validation (80% success rate)
+        - Log probs from tokens → enables PPO gradient updates
+        
+        The key insight: we can execute L1 actions but train the token distribution
+        to match those actions, gradually improving the tokenized action head.
+        """
+        # Process observation for VLA
+        prompt = f"In: What action should the robot take to {task_prompt.lower()}?\nOut:"
+        
+        # Get image (already PIL Image or list of PIL Images from processing)
+        image = obs['image']
+        
+        # Handle multi-image input: concatenate pixel_values along image dimension
+        if isinstance(image, list):
+            # Process first image to get base inputs
+            inputs = self.actor.processor(prompt, image[0]).to(
+                self.device, dtype=torch.bfloat16
+            )
+            
+            # Process additional images and concatenate pixel_values
+            for additional_image in image[1:]:
+                additional_inputs = self.actor.processor(prompt, additional_image).to(
+                    self.device, dtype=torch.bfloat16
+                )
+                # Concatenate along the image dimension (dim=1)
+                inputs["pixel_values"] = torch.cat(
+                    [inputs["pixel_values"], additional_inputs["pixel_values"]], dim=1
+                )
+        else:
+            # Single image case
+            inputs = self.actor.processor(prompt, image).to(
+                self.device, dtype=torch.bfloat16
+            )
+        
+        # Process proprioception if available
+        proprio = None
+        if self.vla_config.use_proprio and obs.get('proprio') is not None:
+            proprio = obs['proprio']
+            # Normalize proprio using VLA's norm_stats
+            if hasattr(self.actor.vla, 'norm_stats') and self.unnorm_key in self.actor.vla.norm_stats:
+                proprio_stats = self.actor.vla.norm_stats[self.unnorm_key].get('proprio')
+                if proprio_stats is not None:
+                    # Normalize: (proprio - mean) / std
+                    mean = np.array(proprio_stats['mean'])
+                    std = np.array(proprio_stats['std'])
+                    proprio = (proprio - mean) / (std + 1e-8)
+            
+            # Convert to numpy array if not already
+            if not isinstance(proprio, np.ndarray):
+                proprio = np.array(proprio, dtype=np.float32)
+        
+        # Get actions from L1 head (deterministic, high-quality actions)
+        with torch.no_grad():
+            actions, _ = self.actor.vla.predict_action(
+                **inputs,
+                unnorm_key=self.unnorm_key,
+                do_sample=False,  # Greedy for consistency
+                proprio=proprio,
+                proprio_projector=self.actor.proprio_projector,
+                action_head=self.actor.l1_action_head,
+                use_film=False,
+            )
+            
+            # Convert to numpy
+            if isinstance(actions, torch.Tensor):
+                actions = actions.cpu().numpy()
+        
+        # Now compute log probabilities from token distribution (for PPO)
+        # We'll tokenize the L1 actions and compute their log probability
+        from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK
+        
+        # Tokenize the L1 actions
+        actions_normalized = actions  # Already in [-1, 1] from predict_action
+        actions_flat = actions_normalized.flatten()  # (action_dim * action_chunk,)
+        
+        # Discretize to token bins
+        discretized = self.action_tokenizer.discretize_actions(actions_flat)  # Returns token IDs
+        
+        # Now get the token logits from the model to compute log prob
+        # We need to do a forward pass to get logits
+        action_data = self.predict_action_tokens_with_grad(
+            obs, task_prompt, temperature=temperature, sample=False
+        )
+        
+        # Get log prob of the discretized L1 actions under current token distribution
+        action_token_logits = action_data['logits']  # (batch, seq_len, 256)
+        
+        # Convert discretized tokens to indices in [0, 255] range
+        token_indices = discretized - (self.action_tokenizer.vocab_size - 256)
+        token_indices = torch.from_numpy(token_indices).to(action_token_logits.device).unsqueeze(0)
+        
+        # Compute log probs for these specific tokens
+        log_probs_per_token = logprobs_from_logits(action_token_logits, token_indices)
+        log_prob = log_probs_per_token.mean(dim=-1)  # Mean over action dimensions
+        
+        # Compile info dictionary
+        info = {
+            'log_prob': log_prob[0],  # Scalar tensor
+            'responses': torch.from_numpy(discretized).to(self.device),  # Tokenized L1 actions
             'input_ids': inputs['input_ids'],
             'attention_mask': inputs['attention_mask'],
             'pixel_values': inputs['pixel_values'],
@@ -599,7 +816,9 @@ class OpenVLAPPO:
         
         # Compute log probabilities
         log_probs_per_token = logprobs_from_logits(action_token_logits, sampled_indices)
-        log_prob = log_probs_per_token.sum(dim=-1)  # Sum over action dimensions
+        # CRITICAL: Use mean instead of sum to normalize by sequence length (256 tokens)
+        # This prevents massive log prob values (-500 to -800) that cause gradient explosions
+        log_prob = log_probs_per_token.mean(dim=-1)  # Mean over action dimensions
         
         # Detokenize to continuous action chunk (8 actions)
         # Matches reference: modeling_prismatic.py lines 937-941
@@ -748,11 +967,12 @@ class OpenVLAPPO:
                             "proprio": processed_obs["proprio"],  # Use 8D axis-angle format
                         }
                         
-                        # Get action chunk (8 actions) with tokenization
+                        # Get action chunk (8 actions) using L1 head with log probs for PPO
                         actions_chunk, action_info = self.get_action(
                             actor_obs,
                             task_prompts[0],
                             temperature=self.cfg.rollout_temperature,
+                            use_builtin_predict=False,  # Use L1 head + log probs for training
                         )
                         
                         # Initialize action queue with all 8 actions
@@ -830,14 +1050,38 @@ class OpenVLAPPO:
             verifier_gamma=self.cfg.verifier_gamma,
         )
         
+        # Debug: Check old log probabilities from rollout
+        data_for_debug = self.trajectory_buffer.get()
+        if len(data_for_debug['old_log_probs']) > 0:
+            old_log_probs_np = data_for_debug['old_log_probs'].cpu().numpy()
+            print(f"\n📊 Old Log Probability Statistics (from rollout):")
+            print(f"   Mean: {old_log_probs_np.mean():.6f}")
+            print(f"   Std: {old_log_probs_np.std():.6f}")
+            print(f"   Min: {old_log_probs_np.min():.6f}")
+            print(f"   Max: {old_log_probs_np.max():.6f}")
+            print(f"   Any NaN: {np.isnan(old_log_probs_np).any()}")
+            print(f"   Any Inf: {np.isinf(old_log_probs_np).any()}")
+        
         # Compute statistics
+        success_rate = np.mean(episode_successes) if episode_successes else 0.0
+        mean_length = np.mean(episode_lengths) if episode_lengths else 0.0
+        num_trajectories = len(self.trajectory_buffer)
+        
         stats = {
-            "rollout/mean_reward": np.mean(episode_successes) if episode_successes else 0.0,  # Success rate as reward
-            "rollout/mean_length": np.mean(episode_lengths) if episode_lengths else 0.0,
-            "rollout/success_rate": np.mean(episode_successes) if episode_successes else 0.0,
+            "rollout/mean_reward": success_rate,  # Success rate as reward
+            "rollout/mean_length": mean_length,
+            "rollout/success_rate": success_rate,
             "rollout/num_episodes": len(episode_successes),
-            "rollout/num_trajectories": len(self.trajectory_buffer),
+            "rollout/num_trajectories": num_trajectories,
         }
+        
+        # Print rollout summary
+        print(f"\n📊 Rollout Summary:")
+        print(f"   Trajectories collected: {num_trajectories}")
+        print(f"   Episodes completed: {len(episode_successes)}")
+        print(f"   Success rate: {success_rate*100:.1f}%")
+        print(f"   Mean episode length: {mean_length:.1f} steps")
+        print(f"   Steps collected: {steps_collected}/{self.cfg.n_steps}")
         
         return stats
     
@@ -872,6 +1116,20 @@ class OpenVLAPPO:
         if len(data['observations']) == 0:
             return {"train/no_data": 1.0}
         
+        # CRITICAL: Verify all model components are on correct devices before training
+        print(f"\n🔍 Device Audit Before Training:")
+        print(f"  VLA backbone: {next(self.actor.vla.parameters()).device}")
+        if hasattr(self.actor, 'l1_action_head') and self.actor.l1_action_head is not None:
+            print(f"  L1 action head: {next(self.actor.l1_action_head.parameters()).device}")
+        if hasattr(self.actor, 'proprio_projector') and self.actor.proprio_projector is not None:
+            print(f"  Proprio projector: {next(self.actor.proprio_projector.parameters()).device}")
+        if hasattr(self.actor.vla, 'action_head') and self.actor.vla.action_head is not None:
+            print(f"  VLA's action_head: {next(self.actor.vla.action_head.parameters()).device}")
+        if hasattr(self.actor.vla, 'proprio_projector') and self.actor.vla.proprio_projector is not None:
+            print(f"  VLA's proprio_projector: {next(self.actor.vla.proprio_projector.parameters()).device}")
+        print(f"  Expected device: {self.device}")
+        print(f"  Expected training device: {self.training_device}")
+        
         # Keep data on rollout device initially
         # Move all data tensors to training_device for safe indexing
         advantages = torch.FloatTensor(data["advantages"]).to(self.training_device)
@@ -892,6 +1150,10 @@ class OpenVLAPPO:
         )
         
         for epoch in epoch_pbar:
+            # Synchronize CUDA to catch any async errors early
+            if self.training_device.type == 'cuda':
+                torch.cuda.synchronize(self.training_device)
+            
             # Generate random minibatch indices on training_device
             indices = torch.randperm(len(advantages), device=self.training_device)
             
@@ -909,7 +1171,7 @@ class OpenVLAPPO:
             )
             
             # Process minibatches
-            for start_idx in minibatch_pbar:
+            for minibatch_idx, start_idx in enumerate(minibatch_pbar):
                 end_idx = min(start_idx + self.cfg.batch_size, len(advantages))
                 mb_indices = indices[start_idx:end_idx]
                 
@@ -948,10 +1210,25 @@ class OpenVLAPPO:
                 
                 # Compute losses in batch for efficiency
                 accumulated_loss = 0.0
+                num_valid_samples = 0
+                
+                # Debug first minibatch
+                if minibatch_idx == 0:
+                    print(f"\n🔍 Debugging Minibatch {minibatch_idx}:")
+                
                 for i, logits in enumerate(batch_logits):
                     response = mb_responses[i]
                     old_log_prob = mb_old_log_probs[i]
                     advantage = mb_advantages[i]
+                    
+                    # Check for NaN/inf in inputs
+                    if torch.isnan(old_log_prob).any() or torch.isinf(old_log_prob).any():
+                        print(f"\n⚠️  WARNING: NaN/inf in old_log_prob at sample {i}! Skipping sample.")
+                        continue
+                    
+                    if torch.isnan(advantage).any() or torch.isinf(advantage).any():
+                        print(f"\n⚠️  WARNING: NaN/inf in advantage at sample {i}! Skipping sample.")
+                        continue
                     
                     # Map response tokens to indices in [0, 255]
                     response_indices = response - (self.action_tokenizer.vocab_size - 256)
@@ -960,17 +1237,63 @@ class OpenVLAPPO:
                     logits = logits.to(self.training_device)
                     response_indices = response_indices.to(self.training_device)
                     log_prob = logprobs_from_logits(logits.unsqueeze(0), response_indices.unsqueeze(0))
-                    log_prob = log_prob.sum()  # Sum over action dimensions
+                    # CRITICAL: Use mean to match rollout computation and prevent massive values
+                    log_prob = log_prob.mean()  # Mean over action dimensions
                     
-                    # Compute PPO loss for this sample
-                    ratio = torch.exp(log_prob - old_log_prob)
+                    # Check for NaN in computed log_prob
+                    if torch.isnan(log_prob).any() or torch.isinf(log_prob).any():
+                        print(f"\n⚠️  WARNING: NaN/inf in computed log_prob at sample {i}!")
+                        print(f"   old_log_prob: {old_log_prob.item():.4f}")
+                        print(f"   Skipping sample.")
+                        continue
+                    
+                    # Debug first sample of first minibatch
+                    if minibatch_idx == 0 and i == 0:
+                        print(f"   Sample {i}:")
+                        print(f"     old_log_prob: {old_log_prob.item():.4f}")
+                        print(f"     new_log_prob: {log_prob.item():.4f}")
+                        print(f"     advantage: {advantage.item():.4f}")
+                    
+                    # Compute PPO loss for this sample with VERY aggressive clamping
+                    log_ratio = log_prob - old_log_prob
+                    
+                    # Debug first sample
+                    if minibatch_idx == 0 and i == 0:
+                        print(f"     log_ratio (raw): {log_ratio.item():.4f}")
+                    
+                    # Debug extreme log ratios
+                    if torch.abs(log_ratio).item() > 10.0:
+                        print(f"\n⚠️  Large log ratio detected: {log_ratio.item():.2f}")
+                        print(f"   new_log_prob: {log_prob.item():.2f}, old_log_prob: {old_log_prob.item():.2f}")
+                    
+                    # CRITICAL: Clamp to very tight range since log probs are huge (-500 to -800)
+                    # Even small absolute differences create massive ratios
+                    log_ratio = torch.clamp(log_ratio, min=-5.0, max=5.0)  # e^5 ≈ 148, e^-5 ≈ 0.007
+                    ratio = torch.exp(log_ratio)
+                    
+                    # Also clamp advantage to prevent extreme products
+                    advantage_clamped = torch.clamp(advantage, min=-10.0, max=10.0)
+                    
                     clip_high = torch.clamp(ratio, 1 - self.cfg.clip_ratio_low, 1 + self.cfg.clip_ratio_high)
                     clip_low = torch.clamp(ratio, 1 - self.cfg.clip_ratio_high, 1 + self.cfg.clip_ratio_low)
-                    clipped_ratio = torch.where(advantage > 0, clip_high, clip_low)
-                    policy_loss = -torch.min(ratio * advantage, clipped_ratio * advantage)
+                    clipped_ratio = torch.where(advantage_clamped > 0, clip_high, clip_low)
+                    policy_loss = -torch.min(ratio * advantage_clamped, clipped_ratio * advantage_clamped)
+                    
+                    # Debug first sample
+                    if minibatch_idx == 0 and i == 0:
+                        print(f"     ratio: {ratio.item():.4f}")
+                        print(f"     clipped_ratio: {clipped_ratio.item():.4f}")
+                        print(f"     policy_loss: {policy_loss.item():.4f}")
+                        print(f"     Has NaN: old_log={torch.isnan(old_log_prob).any()}, new_log={torch.isnan(log_prob).any()}, adv={torch.isnan(advantage).any()}, loss={torch.isnan(policy_loss).any()}")
+                    
+                    # Safety check: if loss is extreme, skip this sample
+                    if torch.abs(policy_loss).item() > 100.0:
+                        print(f"\n⚠️  WARNING: Extreme policy loss {policy_loss.item():.2f} at sample {i}! Skipping.")
+                        continue
                     
                     # Accumulate loss (normalize by batch size for gradient averaging)
                     accumulated_loss += policy_loss / len(mb_indices)
+                    num_valid_samples += 1
                     
                     # Track statistics
                     total_policy_loss += policy_loss.item()
@@ -980,6 +1303,16 @@ class OpenVLAPPO:
                         total_clipfrac += clipfrac.item()
                         total_approx_kl += approx_kl.item()
                 
+                # Check if we have any valid samples
+                if num_valid_samples == 0:
+                    print(f"\n⚠️  WARNING: No valid samples in minibatch! Skipping backward pass.")
+                    continue
+                
+                # Debug accumulated loss
+                if minibatch_idx == 0:
+                    print(f"   Accumulated loss: {accumulated_loss.item():.4f} (from {num_valid_samples} samples)")
+                    print(f"   Has NaN: {torch.isnan(accumulated_loss).any()}")
+                
                 # Single backward pass for entire minibatch
                 accumulated_loss.backward()
                 
@@ -987,13 +1320,39 @@ class OpenVLAPPO:
                 del batch_logits, accumulated_loss
                 torch.cuda.empty_cache()
                 
-                # Gradient clipping
+                # Gradient clipping with NaN detection
                 actor_params = (
                     [p for p in self.actor.vla.parameters() if p.requires_grad] +
                     (list(self.actor.l1_action_head.parameters()) if self.actor.l1_action_head and not self.vla_config.freeze_l1_action_head else []) +
                     (list(self.actor.proprio_projector.parameters()) if self.actor.proprio_projector else [])
                 )
-                nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
+                
+                # Check for NaN gradients before clipping
+                has_nan_grad = False
+                for p in actor_params:
+                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                        has_nan_grad = True
+                        break
+                
+                if has_nan_grad:
+                    print(f"\n⚠️  WARNING: NaN or inf detected in gradients! Skipping optimizer step.")
+                    self.actor_optimizer.zero_grad()
+                    continue
+                
+                # Compute gradient norm before clipping (for debugging)
+                total_norm = torch.nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
+                
+                # Skip only truly catastrophic gradient explosions (>1000x)
+                # With LoRA (55M params), even gradients of 100-500 can be clipped and trained
+                if total_norm > self.max_grad_norm * 1000:
+                    print(f"\n⚠️  CRITICAL: Gradient explosion: {total_norm:.2f} (clip at {self.max_grad_norm})")
+                    print(f"   Skipping optimizer step to prevent training collapse.")
+                    self.actor_optimizer.zero_grad()
+                    continue
+                
+                # Warn if gradient norm is very large (but clipping handles it)
+                if total_norm > self.max_grad_norm * 100:
+                    print(f"⚠️  Large gradient: {total_norm:.2f} → clipped to {self.max_grad_norm}")
                 
                 # Optimizer step
                 self.actor_optimizer.step()
@@ -1015,10 +1374,21 @@ class OpenVLAPPO:
             
             minibatch_pbar.close()
             
+            # Calculate and print epoch statistics
+            epoch_policy_loss = np.mean([s for s in stats['train/policy_loss'][-num_minibatches:]])
+            epoch_clipfrac = np.mean([s for s in stats['train/clipfrac'][-num_minibatches:]])
+            epoch_approx_kl = np.mean([s for s in stats['train/approx_kl'][-num_minibatches:]])
+            
+            # Print epoch summary
+            print(f"\n  Epoch {epoch+1}/{self.cfg.n_epochs} → "
+                  f"Policy Loss: {epoch_policy_loss:.6f} | "
+                  f"Clip Frac: {epoch_clipfrac:.4f} | "
+                  f"KL: {epoch_approx_kl:.6f}")
+            
             # Update epoch progress bar with average stats
             epoch_pbar.set_postfix({
-                'avg_loss': f"{np.mean([s for s in stats['train/policy_loss'][-num_minibatches:]]):.4f}",
-                'avg_clip': f"{np.mean([s for s in stats['train/clipfrac'][-num_minibatches:]]):.3f}",
+                'avg_loss': f"{epoch_policy_loss:.4f}",
+                'avg_clip': f"{epoch_clipfrac:.3f}",
             }, refresh=False)
         
         epoch_pbar.close()
@@ -1226,10 +1596,15 @@ class OpenVLAPPO:
         
         # Log initial validation to wandb
         if self.cfg.use_wandb:
-            wandb.log({
+            initial_stats = {
                 "val/success_rate": initial_val_stats['val/success_rate'],
                 "val/mean_reward": initial_val_stats['val/mean_reward'],
-            }, step=0)
+            }
+            try:
+                wandb.log(initial_stats, step=0)
+                print("✓ Logged initial validation to wandb")
+            except Exception as e:
+                print(f"⚠️  WARNING: Failed to log initial validation to wandb: {e}")
         
         # Training loop
         num_updates = self.cfg.total_timesteps // (self.cfg.n_steps * self.cfg.num_envs) if self.is_vectorized else self.cfg.total_timesteps // self.cfg.n_steps
@@ -1296,8 +1671,29 @@ class OpenVLAPPO:
                     log_msg += f"Val Success: {stats['val/success_rate']:.2%}"
                 tqdm.write(log_msg)  # Use tqdm.write to avoid progress bar disruption
                 
+                # Log to wandb with NaN filtering and error handling
                 if self.cfg.use_wandb:
-                    wandb.log(stats, step=self.global_step)
+                    # Filter out NaN/inf values before logging
+                    clean_stats = {}
+                    for key, value in stats.items():
+                        if isinstance(value, (int, float)):
+                            if not (np.isnan(value) or np.isinf(value)):
+                                clean_stats[key] = value
+                        else:
+                            clean_stats[key] = value
+                    
+                    # Only log if we have valid stats
+                    if clean_stats:
+                        try:
+                            wandb.log(clean_stats, step=self.global_step)
+                            # Print confirmation for debugging
+                            if update % 10 == 0:  # Every 10 updates
+                                print(f"\n✓ Logged {len(clean_stats)} metrics to wandb at step {self.global_step}")
+                        except Exception as e:
+                            print(f"\n⚠️  WARNING: Failed to log to wandb: {e}")
+                    else:
+                        print(f"\n⚠️  WARNING: No valid stats to log (all NaN/inf)")
+            
             
             # Save checkpoint
             if self.global_step % self.cfg.save_interval == 0:

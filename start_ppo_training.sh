@@ -2,6 +2,8 @@
 # Start PPO training with full cleanup and detachment
 # Handles CUDA memory cleanup and survives SSH disconnects
 
+export CUDA_VISIBLE_DEVICES=1
+
 echo "========================================="
 echo "PPO Training Launcher"
 echo "========================================="
@@ -66,10 +68,9 @@ echo "✓ Completely detached from terminal"
 echo ""
 echo "Configuration:"
 echo "  - Task: libero_spatial, task_id=0"
-echo "  - Total timesteps: 100,000"
-echo "  - Seed: 0 (matches eval)"
+echo "  - Total timesteps: 10,000,000"
 echo "  - Action chunking: 8 actions/query"
-echo "  - Device: Multi-GPU (VLA on cuda:1, training on cuda:0)"
+echo "  - GPU config: Read from vla_oft/min_vla/config.py"
 echo "  - Wandb: enabled"
 echo ""
 echo "Monitor with:"

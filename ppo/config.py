@@ -24,23 +24,28 @@ class PPOConfig:
     Typical values: 50k-1M for single task, 500k-5M for multi-task.
     """
     
-    n_steps: int = 10
+    n_steps: int = 512
     """Number of environment steps to collect before each policy update (rollout length).
     This is NOT the episode length - episodes can span multiple updates.
     - Higher values (500-2048): More stable gradients, slower updates, better for complex tasks
     - Lower values (128-256): Faster updates, more exploration, better for simple tasks
     Trade-off: Large n_steps needs more memory but provides better advantage estimates.
+    
+    Set to 512 to ensure at least 1-2 episodes complete per rollout for sparse reward learning.
+    LIBERO episodes typically need 200-600 actions, so 128 was too short.
     """
     
-    batch_size: int = 1
+    batch_size: int = 2
     """Minibatch size for SGD updates during policy optimization.
-    Set to 1 to minimize memory usage during gradient computation with 7B model on 24GB GPU.
-    - Larger batches (32-64): More stable gradients, higher memory
-    - Smaller batches (8-16): Lower memory, more noise
+    With n_steps=128, batch_size=2 provides maximum memory efficiency while maintaining some gradient stability.
+    - Larger batches (4-8): More stable gradients, higher memory
+    - Smaller batches (1-2): Lower memory, more noise
     Must divide evenly into n_steps for best results.
+    
+    Using batch_size=2 to avoid OOM with 7B LoRA model during backward pass.
     """
     
-    n_epochs: int = 1
+    n_epochs: int = 10
     """Number of passes through the collected data during each policy update.
     Each update, we iterate over the n_steps buffer this many times.
     - Higher epochs (10-20): More learning per sample, risk of overfitting
@@ -191,7 +196,7 @@ class PPOConfig:
     Set to 0 to disable validation during training.
     """
     
-    val_episodes: int = 20
+    val_episodes: int = 10
     """Number of episodes to run during each validation phase.
     More episodes give better success rate estimates but take longer.
     - 5-10: Quick validation

@@ -478,7 +478,7 @@ class OpenVLAPPO:
             image = Image.fromarray(image)
         
         # Handle multi-image input: concatenate pixel_values along image dimension
-        if isinstance(image, list):
+        if isinstance(image, list) and len(image) > 1:
             # Process first image to get base inputs
             inputs = self.actor.processor(prompt, image[0]).to(
                 self.device, dtype=torch.bfloat16
@@ -494,8 +494,9 @@ class OpenVLAPPO:
                     [inputs["pixel_values"], additional_inputs["pixel_values"]], dim=1
                 )
         else:
-            # Single image
-            inputs = self.actor.processor(prompt, image).to(self.device, dtype=torch.bfloat16)
+            # Single image (either list with 1 element or not a list)
+            single_img = image[0] if isinstance(image, list) else image
+            inputs = self.actor.processor(prompt, single_img).to(self.device, dtype=torch.bfloat16)
         
         input_ids = inputs["input_ids"]
         pixel_values = inputs["pixel_values"]
@@ -736,7 +737,7 @@ class OpenVLAPPO:
                             obs,
                             camera_name="agentview",
                             resize_size=self.cfg.image_size,
-                            num_images=1,  # Single camera to save memory during training
+                            num_images=self.vla_config.num_images_in_input,  # Match model's expected input (2 cameras)
                             center_crop=True,
                             crop_scale=0.9,
                             return_pil=True,  # Return PIL Images for VLA processor
@@ -760,12 +761,14 @@ class OpenVLAPPO:
                         for act in actions_chunk:
                             self.action_queue.append(act)
                         
-                        # Store action_info separately (same for all actions in chunk)
+                        # Store action_info and observation separately (same for all actions in chunk)
                         self.current_action_info = action_info
+                        self.current_actor_obs = actor_obs
                     
-                    # Pop action from queue
+                    # Pop action from queue and use stored observation/info
                     action = self.action_queue.popleft()
                     action_info = self.current_action_info
+                    actor_obs = self.current_actor_obs
                     
                     # Process action for LIBERO (normalize + invert gripper)
                     action = process_action_for_libero(action)
@@ -782,9 +785,10 @@ class OpenVLAPPO:
                         episode_successes.append(float(success))
                         episode_lengths.append(current_episode_length + 1)
                         current_episode_length = 0
-                        # Clear action queue and info on episode end
+                        # Clear action queue, info, and observation on episode end
                         self.action_queue.clear()
                         self.current_action_info = None
+                        self.current_actor_obs = None
                         obs, info = env.reset()
                     else:
                         current_episode_length += 1
@@ -1068,11 +1072,11 @@ class OpenVLAPPO:
                 action_queue = deque(maxlen=8)
                 
                 # Debug: Print first episode info
-                if ep == 0:
-                    print(f"\n[DEBUG] Validation episode {ep}:")
-                    print(f"  Task: {task_prompt}")
-                    print(f"  Obs keys: {list(obs.keys())}")
-                    print(f"  Image shape: {obs.get('agentview_image', np.array([])).shape}")
+                # if ep == 0:
+                #     print(f"\n[DEBUG] Validation episode {ep}:")
+                #     print(f"  Task: {task_prompt}")
+                #     print(f"  Obs keys: {list(obs.keys())}")
+                #     print(f"  Image shape: {obs.get('agentview_image', np.array([])).shape}")
                 
                 while not done:
                     # Query policy if action queue is empty
@@ -1249,6 +1253,12 @@ class OpenVLAPPO:
             # Combine stats
             stats = {**rollout_stats, **train_stats}
             stats["global_step"] = self.global_step
+            
+            # Print policy loss after every update
+            if "train/policy_loss" in train_stats:
+                print(f"\n[Update {update}] Policy Loss: {train_stats['train/policy_loss']:.6f} | "
+                      f"Clip Frac: {train_stats.get('train/clipfrac', 0):.4f} | "
+                      f"KL: {train_stats.get('train/approx_kl', 0):.6f}")
             
             # Validation
             if self.global_step % self.cfg.val_interval == 0:

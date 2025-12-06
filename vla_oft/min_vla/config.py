@@ -16,8 +16,8 @@ class OpenVLAActorConfig:
 
     # GPU configuration
     use_multi_gpu: bool = True  # Enable to split model across GPUs
-    gpu_id: int = 1  # Primary GPU for VLA backbone (vision + language model)
-    secondary_gpu_id: int = 0  # Secondary GPU for training components (action head, value head, gradients)
+    gpu_id: int = 0  # Primary GPU for VLA backbone (vision + language model)
+    secondary_gpu_id: int = 1  # Secondary GPU for training components (action head, value head, gradients)
     
     """
     Multi-GPU Memory Distribution Strategy:
@@ -174,16 +174,16 @@ class OpenVLAActorConfig:
     Requires: pip install peft
     """
     
-    lora_rank: int = 32
+    lora_rank: int = 16
     """LoRA rank (r) - controls adapter size and expressiveness.
     
     Higher rank = more parameters = better adaptation but more memory:
     - r=8: ~50M params, ~1GB memory, faster training
     - r=16: ~100M params, ~2GB memory, good balance
-    - r=32: ~200M params, ~4GB memory, best quality (recommended)
+    - r=32: ~200M params, ~4GB memory, best quality
     - r=64: ~400M params, ~8GB memory, overkill for most tasks
     
-    Recommendation: 32 for robotics tasks (good quality/memory trade-off)
+    Reduced from 32 to 16 to avoid OOM on 24GB GPU with other processes.
     """
     
     lora_alpha: int = 16

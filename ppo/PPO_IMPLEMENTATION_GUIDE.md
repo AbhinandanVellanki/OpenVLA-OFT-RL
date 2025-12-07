@@ -50,65 +50,65 @@ This guide documents our implementation of **Group Relative Policy Optimization 
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    1. VLA Actor Setup                        │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ • Load OpenVLA-7B checkpoint (7.6B params)           │  │
-│  │ • Apply LoRA adapters (55.4M trainable params)       │  │
-│  │ • Freeze base backbone (7.5B params)                 │  │
-│  │ • Initialize action tokenizer (256 bins)             │  │
-│  │ • Setup proprio projector (16.8M params)             │  │
-│  └──────────────────────────────────────────────────────┘  │
+│                    1. VLA Actor Setup                       │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ • Load OpenVLA-7B checkpoint (7.6B params)           │   │
+│  │ • Apply LoRA adapters (55.4M trainable params)       │   │
+│  │ • Freeze base backbone (7.5B params)                 │   │
+│  │ • Initialize action tokenizer (256 bins)             │   │
+│  │ • Setup proprio projector (16.8M params)             │   │
+│  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
-│                  2. Rollout Collection                       │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ • Stochastic action sampling (temp=1.0)              │  │
-│  │ • Store: obs, actions, log_probs                     │  │
-│  │ • Collect 512 steps (6-7 trajectories)               │  │
-│  │ • Sparse rewards: 1.0 at success, 0.0 otherwise      │  │
-│  └──────────────────────────────────────────────────────┘  │
+│                  2. Rollout Collection                      │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ • Stochastic action sampling (temp=1.0)              │   │
+│  │ • Store: obs, actions, log_probs                     │   │
+│  │ • Collect 512 steps (6-7 trajectories)               │   │
+│  │ • Sparse rewards: 1.0 at success, 0.0 otherwise      │   │
+│  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
-│               3. GRPO Advantage Computation                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ • Group trajectories by success/failure              │  │
-│  │ • Compute: advantage = reward - group_mean           │  │
-│  │ • Normalize advantages: (A - μ) / σ                  │  │
-│  │ • Result: A ∈ [-10, 10], mean=0.98 for successes    │  │
-│  └──────────────────────────────────────────────────────┘  │
+│               3. GRPO Advantage Computation                 │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ • Group trajectories by success/failure              │   │
+│  │ • Compute: advantage = reward - group_mean           │   │
+│  │ • Normalize advantages: (A - μ) / σ                  │   │
+│  │ • Result: A ∈ [-10, 10], mean=0.98 for successes     │   │
+│  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
-│                  4. Policy Loss Calculation                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ • Forward pass VLA to get new log_probs              │  │
-│  │ • Compute log ratio: log(π_new/π_old)                │  │
-│  │ • Clamp log ratio: [-5, 5]                           │  │
-│  │ • PPO clipped loss with asymmetric clipping          │  │
-│  │ • Result: policy_loss = -0.18 (NEGATIVE to maximize) │  │
-│  └──────────────────────────────────────────────────────┘  │
+│                  4. Policy Loss Calculation                 │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ • Forward pass VLA to get new log_probs              │   │
+│  │ • Compute log ratio: log(π_new/π_old)                │   │
+│  │ • Clamp log ratio: [-5, 5]                           │   │
+│  │ • PPO clipped loss with asymmetric clipping          │   │
+│  │ • Result: policy_loss = -0.18 (NEGATIVE to maximize) │   │
+│  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
-│            5. Gradient Protection & Clipping                 │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ • Per-sample backward() (prevents graph buildup)     │  │
-│  │ • Gradient clipping: max_norm=1.0                    │  │
-│  │ • Skip threshold: gradient > 1000 → skip update      │  │
-│  │ • Result: gradients 20-600 clipped and applied       │  │
-│  └──────────────────────────────────────────────────────┘  │
+│            5. Gradient Protection & Clipping                │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ • Per-sample backward() (prevents graph buildup)     │   │
+│  │ • Gradient clipping: max_norm=1.0                    │   │
+│  │ • Skip threshold: gradient > 1000 → skip update      │   │
+│  │ • Result: gradients 20-600 clipped and applied       │   │ 
+│  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
-│                     6. Policy Updates                        │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ • 10 epochs over collected data                      │  │
-│  │ • 256 minibatches per epoch (batch_size=2)           │  │
-│  │ • AdamW optimizer step after gradient accumulation   │  │
-│  │ • Log metrics: loss, clip_frac, KL divergence        │  │
-│  └──────────────────────────────────────────────────────┘  │
+│                     6. Policy Updates                       │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ • 10 epochs over collected data                      │   │ 
+│  │ • 256 minibatches per epoch (batch_size=2)           │   │
+│  │ • AdamW optimizer step after gradient accumulation   │   │
+│  │ • Log metrics: loss, clip_frac, KL divergence        │   │
+│  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -360,37 +360,6 @@ Total Trainable:             72,232,320 (0.95%)
 Total Frozen:             7,541,237,184 (99.05%)
 ```
 
-### LoRA Initialization Bug Fix
-
-**Problem Found**: Originally, LoRA was only applied when **both** `use_lora=True` AND `freeze_vla_backbone=False`. This meant with our config (`use_lora=True`, `freeze_vla_backbone=True`), LoRA was never applied!
-
-**Fix Applied** (lines 126-161):
-
-```python
-# BEFORE (buggy):
-if vla_config.use_lora and not vla_config.freeze_vla_backbone:
-    # Apply LoRA
-    ...
-
-if vla_config.freeze_vla_backbone:
-    # Freeze everything (including LoRA that was never added!)
-    ...
-
-# AFTER (fixed):
-# Step 1: Apply LoRA if requested (independent of freezing)
-if vla_config.use_lora:
-    self.actor.vla = get_peft_model(self.actor.vla, lora_config)
-
-# Step 2: Then apply selective freezing
-if vla_config.freeze_vla_backbone and vla_config.use_lora:
-    # Freeze base backbone, keep LoRA trainable
-    for name, param in self.actor.vla.named_parameters():
-        if 'lora' not in name.lower():
-            param.requires_grad = False
-```
-
-**Result**: LoRA adapters now correctly trainable while base backbone is frozen! ✅
-
 ### Verification Output
 
 ```
@@ -553,24 +522,6 @@ def predict_action_tokens_with_grad(self, obs, task_prompt, temperature=1.0):
         'continuous_action': continuous_action,  # Detokenized [-1, 1]^7
     }
 ```
-
-### Log Probability Computation Fix
-
-**Critical Bug Fixed**: Originally used `.sum()` over 256 action tokens, creating huge negative values (-600 to -800). This caused numerical instability.
-
-**Fix**: Use `.mean()` instead:
-
-```python
-# BEFORE (buggy):
-log_prob = log_probs_per_token.sum()  # Sum over 256 tokens
-# Result: -600 to -800 (too negative!)
-
-# AFTER (fixed):
-log_prob = log_probs_per_token.mean()  # Average over 256 tokens
-# Result: -2 to -15 (reasonable range)
-```
-
-**Impact**: Reduces log prob magnitude by 256x, preventing numerical overflow in ratio computation.
 
 ### Sparse Reward Assignment
 

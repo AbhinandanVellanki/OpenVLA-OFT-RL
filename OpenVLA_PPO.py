@@ -28,6 +28,9 @@ import torch.nn as nn
 import torch.optim as optim
 import wandb
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
 
 # Suppress all warnings for clean console output
 warnings.filterwarnings('ignore')
@@ -43,9 +46,11 @@ tqdm.monitor_interval = 0  # Disable monitor thread warnings
 from vla_oft.min_vla.config import OpenVLAActorConfig
 from vla_oft.min_vla.actor import OpenVLAActor
 from vla_oft.min_vla.action_tokenizer import ActionTokenizer
+from vla_oft.min_vla.value_head import ValueHead
 from ppo.config import PPOConfig
 from ppo.trajectory_buffer import TrajectoryBuffer
 from ppo.core_algos import logprobs_from_logits, compute_policy_loss, apply_mask_with_grad_control
+from ppo.gae_ppo_trainer import GAEPPOExtensions, integrate_gae_into_trajectory_buffer
 from libero_rl.utils.obs_utils import process_observation_for_vla
 from libero_rl.utils.action_utils import process_action_for_libero, get_dummy_action
 from libero_rl.utils.task_utils import get_task, get_max_episode_length, get_all_task_names
@@ -309,12 +314,56 @@ class OpenVLAPPO:
         print(f"   Proprio projector: {trainable_proprio:,}")
         print(f"   Total trainable: {trainable_total:,} / {total:,} ({100*trainable_total/total:.2f}%)")
         print(f"   Frozen: {total - trainable_vla:,} parameters\n")
-        
-        self.actor_optimizer = optim.AdamW(actor_params, lr=ppo_config.actor_lr)
+
+        # Initialize optimizer(s) - GAE uses separate actor/critic, GRPO uses single optimizer
+        if ppo_config.use_gae:
+            print("\n" + "="*70)
+            print("🎯 GAE-PPO Mode: Initializing Value Head and Separate Optimizers")
+            print("="*70)
+
+            # Create value head (3-layer MLP)
+            self.value_head = ValueHead(
+                input_dim=4096,  # OpenVLA hidden size
+                hidden_dim=1024,
+            ).to(self.training_device)
+
+            # Count value head parameters
+            value_params = sum(p.numel() for p in self.value_head.parameters())
+            print(f"   Value head parameters: {value_params:,}")
+
+            # Create GAE extensions with separate optimizers
+            self.gae_ext = GAEPPOExtensions(
+                value_head=self.value_head,
+                vla_model=self.actor.vla,
+                actor_lr=ppo_config.actor_lr,
+                critic_lr=ppo_config.critic_lr,
+                gamma=ppo_config.gamma,
+                gae_lambda=ppo_config.gae_lambda,
+                value_loss_coef=ppo_config.value_loss_coef,
+                freeze_vla_for_critic=ppo_config.freeze_vla_for_critic,
+                device=self.training_device,
+            )
+
+            print("="*70 + "\n")
+        else:
+            print("\n🔵 GRPO Mode: Using single optimizer (value-free)")
+            self.actor_optimizer = optim.AdamW(actor_params, lr=ppo_config.actor_lr)
+            self.value_head = None
+            self.gae_ext = None
+
         self.max_grad_norm = ppo_config.max_grad_norm
-        
+
         # Trajectory buffer for storing complete episodes
         self.trajectory_buffer = TrajectoryBuffer()
+
+        # Integrate GAE into trajectory buffer if enabled
+        if ppo_config.use_gae:
+            integrate_gae_into_trajectory_buffer(
+                trajectory_buffer=self.trajectory_buffer,
+                gae_extensions=self.gae_ext,
+                use_gae=True,
+            )
+            print("✓ Trajectory buffer patched for GAE advantage computation\n")
         
         # Reference policy for KL penalty (frozen copy of actor)
         if ppo_config.kl_coef > 0:
@@ -328,10 +377,15 @@ class OpenVLAPPO:
             print("  Reference policy created (frozen)")
         else:
             self.ref_vla = None
-        
+
         # Training stats
         self.global_step = 0
         self.episode_count = 0
+        self.training_history = defaultdict(list)  # For matplotlib plotting
+
+        # Create plots directory
+        self.plots_dir = Path("plots")
+        self.plots_dir.mkdir(exist_ok=True)
         
         # Multi-task tracking
         self.is_vectorized = ppo_config.num_envs > 1
@@ -923,6 +977,17 @@ class OpenVLAPPO:
                         else:
                             current_episode_lengths[env_idx] += 1
                         
+                        # Compute value estimate if using GAE
+                        if self.cfg.use_gae:
+                            # Get hidden states from VLA
+                            hidden_states = self.actor.vla.get_hidden_states(
+                                obs_dict=actor_obs,
+                                instruction=task_prompts[env_idx],
+                            )
+                            value_estimate = self.value_head(hidden_states).item()
+                        else:
+                            value_estimate = 0.0  # GRPO doesn't use values
+
                         # Add to trajectory buffer
                         self.trajectory_buffer.add(
                             obs=actor_obs,
@@ -935,6 +1000,7 @@ class OpenVLAPPO:
                             reward=sparse_reward,
                             done=done,
                             old_log_prob=action_info['log_prob'],
+                            value=value_estimate,
                         )
                         
                         steps_collected += 1
@@ -1014,6 +1080,17 @@ class OpenVLAPPO:
                         current_episode_length += 1
                         obs = next_obs
                     
+                    # Compute value estimate if using GAE
+                    if self.cfg.use_gae:
+                        # Get hidden states from VLA
+                        hidden_states = self.actor.vla.get_hidden_states(
+                            obs_dict=actor_obs,
+                            instruction=task_prompts[0],
+                        )
+                        value_estimate = self.value_head(hidden_states).item()
+                    else:
+                        value_estimate = 0.0  # GRPO doesn't use values
+
                     # Add to trajectory buffer
                     self.trajectory_buffer.add(
                         obs=actor_obs,
@@ -1025,7 +1102,7 @@ class OpenVLAPPO:
                         action=action,
                         reward=sparse_reward,
                         done=done,
-                        value=0.0,  # GRPO mode: must provide value even if unused
+                        value=value_estimate,
                         old_log_prob=action_info['log_prob'],
                     )
                     
@@ -1183,7 +1260,11 @@ class OpenVLAPPO:
                 
                 # ==================== ACTOR UPDATE (PPO Policy Gradient) ====================
                 # Batch process samples with gradient accumulation
-                self.actor_optimizer.zero_grad()
+                if self.cfg.use_gae:
+                    self.gae_ext.actor_optimizer.zero_grad()
+                    self.gae_ext.critic_optimizer.zero_grad()
+                else:
+                    self.actor_optimizer.zero_grad()
                 
                 total_policy_loss = 0.0
                 total_clipfrac = 0.0
@@ -1307,14 +1388,50 @@ class OpenVLAPPO:
                 if num_valid_samples == 0:
                     print(f"\n⚠️  WARNING: No valid samples in minibatch! Skipping backward pass.")
                     continue
-                
-                # Debug accumulated loss
-                if minibatch_idx == 0:
-                    print(f"   Accumulated loss: {accumulated_loss.item():.4f} (from {num_valid_samples} samples)")
-                    print(f"   Has NaN: {torch.isnan(accumulated_loss).any()}")
-                
-                # Single backward pass for entire minibatch
-                accumulated_loss.backward()
+
+                # ==================== VALUE LOSS (GAE only) ====================
+                if self.cfg.use_gae:
+                    # Compute value estimates for the minibatch
+                    batch_values = []
+                    for i, idx in enumerate(mb_indices_cpu):
+                        obs = data["observations"][idx.item()]
+                        # Get hidden states from VLA
+                        hidden_states = self.actor.vla.get_hidden_states(
+                            obs_dict=obs,
+                            instruction=task_prompt,
+                        )
+                        value_est = self.value_head(hidden_states)
+                        batch_values.append(value_est)
+
+                    # Stack and compute value loss
+                    batch_values = torch.stack(batch_values).squeeze(-1)
+                    mb_returns = returns[mb_indices_cpu].to(self.training_device)
+                    value_loss = self.gae_ext.compute_value_loss(batch_values, mb_returns)
+
+                    # Combined loss
+                    total_loss = accumulated_loss + self.cfg.value_loss_coef * value_loss
+
+                    # Track value loss
+                    stats['train/value_loss'].append(value_loss.item())
+
+                    if minibatch_idx == 0:
+                        print(f"   Accumulated policy loss: {accumulated_loss.item():.4f} (from {num_valid_samples} samples)")
+                        print(f"   Value loss: {value_loss.item():.4f}")
+                        print(f"   Total loss: {total_loss.item():.4f}")
+                        print(f"   Has NaN: {torch.isnan(total_loss).any()}")
+                else:
+                    # GRPO mode: no value loss
+                    total_loss = accumulated_loss
+                    value_loss = torch.tensor(0.0)
+
+                    # Debug accumulated loss
+                    if minibatch_idx == 0:
+                        print(f"   Accumulated loss: {accumulated_loss.item():.4f} (from {num_valid_samples} samples)")
+                        print(f"   Has NaN: {torch.isnan(accumulated_loss).any()}")
+
+                # ==================== BACKWARD PASS ====================
+                # Single backward pass for entire minibatch (policy + value if GAE)
+                total_loss.backward()
                 
                 # Clear batch data
                 del batch_logits, accumulated_loss
@@ -1355,8 +1472,41 @@ class OpenVLAPPO:
                     print(f"⚠️  Large gradient: {total_norm:.2f} → clipped to {self.max_grad_norm}")
                 
                 # Optimizer step
-                self.actor_optimizer.step()
-                
+                if self.cfg.use_gae:
+                    # GAE mode: clip gradients and step both optimizers
+                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.actor.vla.parameters(), self.max_grad_norm
+                    )
+                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.value_head.parameters(), self.max_grad_norm
+                    )
+
+                    # Check for NaN gradients
+                    actor_has_nan = any(
+                        torch.isnan(p.grad).any() or torch.isinf(p.grad).any()
+                        for p in self.actor.vla.parameters()
+                        if p.grad is not None
+                    )
+                    critic_has_nan = any(
+                        torch.isnan(p.grad).any() or torch.isinf(p.grad).any()
+                        for p in self.value_head.parameters()
+                        if p.grad is not None
+                    )
+
+                    if not actor_has_nan and not critic_has_nan:
+                        self.gae_ext.actor_optimizer.step()
+                        self.gae_ext.critic_optimizer.step()
+
+                        stats['train/actor_grad_norm'].append(actor_grad_norm.item() if isinstance(actor_grad_norm, torch.Tensor) else actor_grad_norm)
+                        stats['train/critic_grad_norm'].append(critic_grad_norm.item() if isinstance(critic_grad_norm, torch.Tensor) else critic_grad_norm)
+                    else:
+                        print("\n⚠️  WARNING: NaN/inf detected in gradients! Skipping optimizer step.")
+                        self.gae_ext.actor_optimizer.zero_grad()
+                        self.gae_ext.critic_optimizer.zero_grad()
+                else:
+                    # GRPO mode: update actor only
+                    self.actor_optimizer.step()
+
                 # Track averaged statistics for this minibatch
                 n_samples = len(mb_indices)
                 stats['train/policy_loss'].append(total_policy_loss / n_samples)
@@ -1395,6 +1545,88 @@ class OpenVLAPPO:
         # ...existing code...
         return {k: np.mean(v) for k, v in stats.items()}
     
+    def plot_training_curves(self, update: int):
+        """
+        Create and save matplotlib plots of training metrics.
+
+        Saves plots to plots/ directory after each epoch/update.
+        """
+        if not self.training_history:
+            return
+
+        # Create figure with subplots
+        num_plots = 4 if self.cfg.use_gae else 3
+        fig, axes = plt.subplots(num_plots, 1, figsize=(12, 4*num_plots))
+        if num_plots == 1:
+            axes = [axes]
+
+        plot_idx = 0
+
+        # Plot 1: Losses
+        ax = axes[plot_idx]
+        if 'train/policy_loss' in self.training_history:
+            ax.plot(self.training_history['train/policy_loss'], label='Policy Loss', color='blue')
+        if 'train/value_loss' in self.training_history and self.cfg.use_gae:
+            ax.plot(self.training_history['train/value_loss'], label='Value Loss', color='orange')
+        ax.set_xlabel('Update')
+        ax.set_ylabel('Loss')
+        ax.set_title('Training Losses')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plot_idx += 1
+
+        # Plot 2: Success Rate and Rewards
+        ax = axes[plot_idx]
+        if 'rollout/success_rate' in self.training_history:
+            ax.plot(self.training_history['rollout/success_rate'], label='Success Rate', color='green')
+        if 'val/success_rate' in self.training_history:
+            val_steps = [i * (self.cfg.val_interval // self.cfg.n_steps) for i in range(len(self.training_history['val/success_rate']))]
+            ax.plot(val_steps, self.training_history['val/success_rate'], 'o-', label='Val Success Rate', color='darkgreen', markersize=6)
+        ax.set_xlabel('Update')
+        ax.set_ylabel('Success Rate')
+        ax.set_title('Success Rates')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plot_idx += 1
+
+        # Plot 3: PPO Metrics
+        ax = axes[plot_idx]
+        if 'train/clipfrac' in self.training_history:
+            ax.plot(self.training_history['train/clipfrac'], label='Clip Fraction', color='purple')
+        if 'train/approx_kl' in self.training_history:
+            ax2 = ax.twinx()
+            ax2.plot(self.training_history['train/approx_kl'], label='Approx KL', color='red', alpha=0.7)
+            ax2.set_ylabel('KL Divergence', color='red')
+            ax2.tick_params(axis='y', labelcolor='red')
+        ax.set_xlabel('Update')
+        ax.set_ylabel('Clip Fraction')
+        ax.set_title('PPO Metrics')
+        ax.legend(loc='upper left')
+        ax.grid(True, alpha=0.3)
+        plot_idx += 1
+
+        # Plot 4: Gradient Norms (GAE only)
+        if self.cfg.use_gae and plot_idx < num_plots:
+            ax = axes[plot_idx]
+            if 'train/actor_grad_norm' in self.training_history:
+                ax.plot(self.training_history['train/actor_grad_norm'], label='Actor Grad Norm', color='blue')
+            if 'train/critic_grad_norm' in self.training_history:
+                ax.plot(self.training_history['train/critic_grad_norm'], label='Critic Grad Norm', color='orange')
+            ax.set_xlabel('Update')
+            ax.set_ylabel('Gradient Norm')
+            ax.set_title('Gradient Norms')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # Save plot
+        plot_path = self.plots_dir / f"training_curves_update{update:05d}.png"
+        plt.savefig(plot_path, dpi=100, bbox_inches='tight')
+        plt.close(fig)
+
+        print(f"✓ Saved training plots to {plot_path}")
+
     def validate(self, env, task_prompt: str) -> Dict[str, float]:
         """
         Run validation episodes to measure success rate.
@@ -1628,12 +1860,20 @@ class OpenVLAPPO:
             # Combine stats
             stats = {**rollout_stats, **train_stats}
             stats["global_step"] = self.global_step
-            
-            # Print policy loss after every update
+
+            # Update training history for matplotlib plotting
+            for key, value in stats.items():
+                if key != "global_step" and isinstance(value, (int, float)):
+                    self.training_history[key].append(value)
+
+            # Print update summary
             if "train/policy_loss" in train_stats:
-                print(f"\n[Update {update}] Policy Loss: {train_stats['train/policy_loss']:.6f} | "
-                      f"Clip Frac: {train_stats.get('train/clipfrac', 0):.4f} | "
-                      f"KL: {train_stats.get('train/approx_kl', 0):.6f}")
+                msg = f"\n[Update {update}] Policy Loss: {train_stats['train/policy_loss']:.6f} | " \
+                      f"Clip Frac: {train_stats.get('train/clipfrac', 0):.4f} | " \
+                      f"KL: {train_stats.get('train/approx_kl', 0):.6f}"
+                if self.cfg.use_gae and "train/value_loss" in train_stats:
+                    msg += f" | Value Loss: {train_stats['train/value_loss']:.6f}"
+                print(msg)
             
             # Validation
             if self.global_step % self.cfg.val_interval == 0:
@@ -1693,8 +1933,13 @@ class OpenVLAPPO:
                             print(f"\n⚠️  WARNING: Failed to log to wandb: {e}")
                     else:
                         print(f"\n⚠️  WARNING: No valid stats to log (all NaN/inf)")
-            
-            
+
+                # Create matplotlib plots after logging
+                try:
+                    self.plot_training_curves(update)
+                except Exception as e:
+                    print(f"\n⚠️  WARNING: Failed to create matplotlib plots: {e}")
+
             # Save checkpoint
             if self.global_step % self.cfg.save_interval == 0:
                 self.save_checkpoint(f"checkpoint_{self.global_step}.pt")

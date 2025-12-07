@@ -99,12 +99,32 @@ class PPOConfig:
     
     gae_lambda: float = 0.95
     """Lambda parameter for Generalized Advantage Estimation (GAE-λ).
-    NOTE: Currently unused - GRPO is used instead for advantage estimation.
-    Kept for backward compatibility and future option to switch to GAE.
+    Controls bias-variance tradeoff for advantage estimation.
     - 1.0: High variance, low bias (Monte Carlo)
     - 0.0: Low variance, high bias (TD)
     - 0.95: Standard balanced value
     Formula: A^GAE = Σ(γλ)^t δ_t where δ_t = r_t + γV(s_{t+1}) - V(s_t)
+    Only used when use_gae=True.
+    """
+
+    use_gae: bool = False
+    """Whether to use GAE (Generalized Advantage Estimation) for advantage computation.
+    - False: Use GRPO (value-free) advantage estimation (current default)
+    - True: Use GAE with value head for advantage estimation (requires trained critic)
+
+    GAE provides lower-variance advantage estimates by using a learned value function,
+    which can lead to more stable training and better performance on dense/shaped rewards.
+    GRPO is simpler and works well for sparse binary rewards (success/failure only).
+    """
+
+    freeze_vla_for_critic: bool = False
+    """Whether to freeze VLA backbone when extracting hidden states for critic.
+    - False: Allow gradients to flow back through VLA from critic loss (default)
+    - True: Detach hidden states before passing to value head
+
+    Freezing prevents the value head from affecting the VLA backbone, keeping
+    the actor and critic more independent. This can improve stability but may
+    reduce value prediction accuracy.
     """
     
     verifier_gamma: float = 1.0

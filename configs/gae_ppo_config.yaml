@@ -1,0 +1,167 @@
+# GAE-PPO Training Configuration for OpenVLA
+# This config enables GAE (Generalized Advantage Estimation) for PPO training
+
+# ===========================================
+# GAE-Specific Settings
+# ===========================================
+
+# Enable GAE advantage estimation (vs GRPO)
+use_gae: true
+
+# GAE lambda parameter (bias-variance tradeoff)
+# 0.95 is standard, 1.0 = Monte Carlo, 0.0 = TD(0)
+gae_lambda: 0.95
+
+# Freeze VLA backbone when computing value estimates
+# false: gradients flow through VLA from critic (default)
+# true: detach hidden states before value head
+freeze_vla_for_critic: false
+
+# ===========================================
+# Learning Rates (Separate for Actor/Critic)
+# ===========================================
+
+# Actor learning rate (VLA LoRA adapters)
+# Very low to prevent catastrophic forgetting
+actor_lr: 1.0e-5
+
+# Critic learning rate (value head)
+# Higher than actor since value head trains from scratch
+critic_lr: 3.0e-4
+
+# ===========================================
+# PPO Hyperparameters
+# ===========================================
+
+# Discount factor for GAE
+gamma: 0.99
+
+# Value loss coefficient in total loss
+value_loss_coef: 0.5
+
+# PPO clipping ratios (asymmetric)
+clip_ratio_high: 0.28
+clip_ratio_low: 0.2
+
+# Gradient clipping
+max_grad_norm: 1.0
+
+# Entropy coefficient (for stochastic policies)
+entropy_coef: 0.01
+
+# ===========================================
+# Training Hyperparameters
+# ===========================================
+
+# Total timesteps
+total_timesteps: 100000
+
+# Rollout length per update
+n_steps: 512
+
+# Minibatch size for SGD
+batch_size: 2
+
+# Optimization epochs per update
+n_epochs: 10
+
+# Rollout temperature (exploration)
+rollout_temperature: 1.0
+
+# Eval temperature (greedy)
+eval_temperature: 0.0
+
+# ===========================================
+# Environment Configuration
+# ===========================================
+
+# LIBERO task suite
+task_suite: "libero_spatial"
+
+# Single task ID
+task_id: 0
+
+# Multi-task IDs (for vectorized envs)
+# task_ids: [0, 1, 2, 3]
+
+# Number of parallel environments
+num_envs: 1
+
+# Observation mode
+obs_mode: "image_state"
+
+# Image size
+image_size: [224, 224]
+
+# ===========================================
+# Validation & Logging
+# ===========================================
+
+# Validation interval (steps)
+val_interval: 1000
+
+# Validation episodes
+val_episodes: 10
+
+# Logging interval (steps)
+log_interval: 100
+
+# Save interval (steps)
+save_interval: 10000
+
+# Use Weights & Biases
+use_wandb: true
+
+# WandB entity (optional)
+wandb_entity: null
+
+# ===========================================
+# Device Configuration
+# ===========================================
+
+# Primary device
+device: "cuda:1"
+
+# Training device
+training_device: "cuda:1"
+
+# ===========================================
+# Model Configuration
+# ===========================================
+
+# Use LoRA for VLA
+use_lora: true
+
+# LoRA rank
+lora_rank: 64
+
+# LoRA dropout
+lora_dropout: 0.1
+
+# Freeze VLA backbone (train only LoRA)
+freeze_vla_backbone: true
+
+# Use tokenized actions (required for PPO)
+use_tokenized_actions: true
+
+# Load L1 action head (not needed for PPO)
+load_l1_action_head: false
+
+# ===========================================
+# Advanced Settings
+# ===========================================
+
+# KL divergence coefficient
+kl_coef: 0.0
+
+# Trajectory split for memory
+traj_split_num: 4
+
+# Trajectory mini-batch size
+traj_mini_batch_size: 8
+
+# Separate rollout/training workers
+separate_rollout_training: false
+
+# Verifier gamma (for GRPO, unused with GAE)
+verifier_gamma: 1.0

@@ -57,14 +57,20 @@ class PPOConfig:
     # PPO Algorithm Hyperparameters
     # ===========================================
     
-    actor_lr: float = 1e-6
+    actor_lr: float = 5e-7
     """Learning rate for the actor (VLA policy network).
     Lower than standard RL due to fine-tuning a pretrained 7B model.
-    - 5e-7: Ultra-conservative, prevents gradient explosions even with mean log probs
-    - 1e-6: Very conservative, prevents massive gradient explosions with 7B LoRA
-    - 5e-6: Conservative, prevents NaN losses
-    - 1e-5: Moderate, prevents catastrophic forgetting
+    - 3e-7: Ultra-conservative, for very stable training
+    - 5e-7: Very conservative, good balance of stability and learning speed ✓
+    - 1e-6: Conservative, but can cause high clip fractions with large advantages
+    - 5e-6: Too aggressive for 7B LoRA fine-tuning
+    - 1e-5: Moderate, risk of catastrophic forgetting
     - 1e-4 to 3e-4: Standard RL, use only if training from scratch
+    
+    Reduced from 1e-6 to 5e-7 based on training analysis:
+    - With 1e-6: clip fraction 0.8-0.99 (too aggressive)
+    - Target: clip fraction 0.2-0.4 (stable learning)
+    
     Adam optimizer is used for both actor and critic.
     """
     
@@ -112,6 +118,29 @@ class PPOConfig:
     Used for sparse reward propagation from finish_step.
     - 1.0: No discounting (standard for GRPO)
     - 0.99: Light discounting if needed
+    """
+    
+    advantage_scale: float = 0.5
+    """Scaling factor for advantages to control gradient magnitude.
+    
+    With sparse binary rewards (0 or 1), successful trajectories get advantage=1.0.
+    This can cause large gradients and high clip fractions. Scaling reduces this:
+    
+    - 1.0: No scaling (default GRPO, but can cause clip fraction >0.9)
+    - 0.5: Half-scale advantages (reduces aggressive updates) ✓
+    - 0.3: Strong scaling (very conservative)
+    - 0.1: Extreme scaling (too slow learning)
+    
+    Formula: scaled_advantage = advantage * advantage_scale
+    
+    Effect on training:
+    - advantage_scale=1.0 → clip fraction 0.8-0.99 (unstable)
+    - advantage_scale=0.5 → clip fraction 0.3-0.5 (target range)
+    
+    This is especially important when:
+    - Success rate is high (80-100%) → most advantages are 1.0
+    - Learning rate is conservative (5e-7) but gradients still large
+    - Clip fraction consistently >0.7
     """
     
     entropy_coef: float = 0.01

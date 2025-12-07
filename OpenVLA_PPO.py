@@ -1252,7 +1252,16 @@ class OpenVLAPPO:
                         print(f"   Sample {i}:")
                         print(f"     old_log_prob: {old_log_prob.item():.4f}")
                         print(f"     new_log_prob: {log_prob.item():.4f}")
-                        print(f"     advantage: {advantage.item():.4f}")
+                        print(f"     advantage (raw): {advantage.item():.4f}")
+                    
+                    # CRITICAL: Scale advantage to control gradient magnitude
+                    # With sparse binary rewards (0 or 1), successful trajectories have advantage=1.0
+                    # This causes large gradients and high clip fractions
+                    # Scaling reduces this while maintaining relative importance
+                    advantage = advantage * self.cfg.advantage_scale
+                    
+                    if minibatch_idx == 0 and i == 0:
+                        print(f"     advantage (scaled): {advantage.item():.4f}")
                     
                     # Compute PPO loss for this sample with VERY aggressive clamping
                     log_ratio = log_prob - old_log_prob

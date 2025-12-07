@@ -169,12 +169,14 @@ class TrajectoryBuffer:
                 returns[t] = rewards[t] + verifier_gamma * returns[t + 1]
             
             # GRPO: advantages = returns (no value baseline)
+            # For sparse binary rewards (0 or 1), use ABSOLUTE advantages
+            # This avoids negative advantages that cause policy instability
             advantages = returns.copy()
             
             traj['returns'] = returns
             traj['advantages'] = advantages
         
-        # Normalize advantages across all trajectories with robust NaN/inf handling
+        # Collect all advantages for statistics (but DON'T normalize for sparse rewards)
         all_advantages = np.concatenate([t['advantages'] for t in self.trajectories])
         
         # Check for NaN or inf in advantages
@@ -189,31 +191,28 @@ class TrajectoryBuffer:
         adv_std = all_advantages.std()
         
         # Debug: Print advantage statistics
-        print(f"\n📊 Advantage Statistics:")
+        print(f"\n📊 Advantage Statistics (ABSOLUTE - No Normalization):")
         print(f"   Mean: {adv_mean:.6f}")
         print(f"   Std: {adv_std:.6f}")
         print(f"   Min: {all_advantages.min():.6f}")
         print(f"   Max: {all_advantages.max():.6f}")
         print(f"   Total samples: {len(all_advantages)}")
         
-        # CRITICAL: If all advantages are identical (e.g., all successes), std will be 0
-        # In this case, DON'T normalize - just use raw advantages
-        if adv_std < 1e-6:
-            print(f"⚠️  WARNING: All advantages are nearly identical (std={adv_std:.2e})")
-            print(f"   Skipping normalization to prevent gradient issues.")
-            print(f"   Using raw advantages: mean={adv_mean:.6f}")
-            # Don't normalize - keep original advantages
-        else:
-            # Normal case: normalize advantages
-            adv_std = adv_std + 1e-8
-            
-            for traj in self.trajectories:
-                traj['advantages'] = (traj['advantages'] - adv_mean) / adv_std
-                
-                # Final safety check after normalization
-                if np.any(np.isnan(traj['advantages'])) or np.any(np.isinf(traj['advantages'])):
-                    print(f"⚠️  ERROR: NaN/inf in advantages after normalization! Setting to zeros.")
-                    traj['advantages'] = np.nan_to_num(traj['advantages'], nan=0.0, posinf=0.0, neginf=0.0)
+        # CRITICAL: For sparse binary rewards (0 or 1), DO NOT normalize!
+        # Normalization creates negative advantages which confuse the policy.
+        # Instead, use absolute advantages:
+        #   - Successful trajectories: advantage = 1.0 (increase log prob)
+        #   - Failed trajectories: advantage = 0.0 (no gradient)
+        print(f"\n✓ Using ABSOLUTE advantages (no normalization) for sparse rewards")
+        print(f"  - Successful steps: advantage ≈ {all_advantages.max():.2f}")
+        print(f"  - Failed steps: advantage ≈ {all_advantages.min():.2f}")
+        print(f"  - This ensures policy only increases prob of successful actions\n")
+        
+        # Final safety check
+        for traj in self.trajectories:
+            if np.any(np.isnan(traj['advantages'])) or np.any(np.isinf(traj['advantages'])):
+                print(f"⚠️  ERROR: NaN/inf in advantages! Setting to zeros.")
+                traj['advantages'] = np.nan_to_num(traj['advantages'], nan=0.0, posinf=0.0, neginf=0.0)
     
     def get(self) -> Dict[str, Any]:
         """

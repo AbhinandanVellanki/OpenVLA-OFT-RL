@@ -1565,12 +1565,38 @@ class OpenVLAPPO:
             from datetime import datetime
             dt_string = datetime.now().strftime("%Y%m%d_%H%M%S")
             run_name = f"{self.cfg.task_suite}_tasks{'_'.join(map(str, task_ids)) if self.is_vectorized else str(self.cfg.task_id)}_PPO_{dt_string}"
-            wandb.init(
-                project="OFT_RL",
-                entity=self.cfg.wandb_entity,
-                config={**vars(self.cfg)},
-                name=run_name,
-            )
+            
+            print("\n" + "="*70)
+            print("Initializing Weights & Biases...")
+            print("="*70)
+            
+            try:
+                # Force online mode (not offline)
+                os.environ.pop('WANDB_MODE', None)  # Remove offline mode if set
+                
+                run = wandb.init(
+                    project="OFT_RL",
+                    entity=self.cfg.wandb_entity,
+                    config={**vars(self.cfg)},
+                    name=run_name,
+                    settings=wandb.Settings(start_method="thread"),  # Avoid fork issues
+                    mode="online",  # Force online mode
+                )
+                
+                print(f"✓ wandb initialized successfully!")
+                print(f"  Project: OFT_RL")
+                print(f"  Run name: {run_name}")
+                print(f"  Run URL: {run.get_url()}")
+                print(f"  Entity: {self.cfg.wandb_entity if self.cfg.wandb_entity else 'default'}")
+                print(f"  Mode: {'offline' if wandb.run.mode == 'offline' else 'online'}")
+                print("="*70 + "\n")
+                
+            except Exception as e:
+                print(f"\n⚠️  ERROR: Failed to initialize wandb!")
+                print(f"  Error: {e}")
+                print(f"  Training will continue without wandb logging.")
+                print("="*70 + "\n")
+                self.cfg.use_wandb = False  # Disable wandb for rest of training
         
         # Create environment
         env = make_libero_env(
@@ -1596,13 +1622,12 @@ class OpenVLAPPO:
         
         # Log initial validation to wandb
         if self.cfg.use_wandb:
-            initial_stats = {
-                "val/success_rate": initial_val_stats['val/success_rate'],
-                "val/mean_reward": initial_val_stats['val/mean_reward'],
-            }
             try:
-                wandb.log(initial_stats, step=0)
-                print("✓ Logged initial validation to wandb")
+                wandb.log({
+                    "val/success_rate": initial_val_stats['val/success_rate'],
+                    "val/mean_reward": initial_val_stats['val/mean_reward'],
+                }, step=0)
+                print(f"✓ Logged initial validation to wandb: success_rate={initial_val_stats['val/success_rate']:.2%}, mean_reward={initial_val_stats['val/mean_reward']:.3f}")
             except Exception as e:
                 print(f"⚠️  WARNING: Failed to log initial validation to wandb: {e}")
         
@@ -1635,12 +1660,25 @@ class OpenVLAPPO:
                       f"Clip Frac: {train_stats.get('train/clipfrac', 0):.4f} | "
                       f"KL: {train_stats.get('train/approx_kl', 0):.6f}")
             
-            # Validation
-            if self.global_step % self.cfg.val_interval == 0:
+            # Validation - check AFTER global_step is updated (not before)
+            if self.global_step > 0 and self.global_step % self.cfg.val_interval == 0:
+                print(f"\n🔍 Running validation at step {self.global_step}...")
                 # For multi-task, validate on first task (could extend to all tasks)
                 val_prompt = task_prompts[0] if isinstance(task_prompts, list) else task_prompts
                 val_stats = self.validate(env, val_prompt)
                 stats.update(val_stats)
+                print(f"✓ Validation complete: Success Rate = {val_stats['val/success_rate']:.2%}")
+                
+                # ALWAYS log validation metrics to wandb immediately
+                if self.cfg.use_wandb:
+                    try:
+                        wandb.log({
+                            "val/success_rate": val_stats['val/success_rate'],
+                            "val/mean_reward": val_stats['val/mean_reward'],
+                        }, step=self.global_step)
+                        print(f"✓ Logged validation metrics to wandb: success_rate={val_stats['val/success_rate']:.2%}, mean_reward={val_stats['val/mean_reward']:.3f}")
+                    except Exception as e:
+                        print(f"⚠️  WARNING: Failed to log validation to wandb: {e}")
             
             # Update progress bar with stats
             pbar_stats = {
@@ -1656,43 +1694,38 @@ class OpenVLAPPO:
                 pbar_stats["val"] = f"{stats['val/success_rate']:.1%}"
             pbar.set_postfix(pbar_stats, refresh=True)
             
-            # Logging
-            if update % self.cfg.log_interval == 0:
-                log_msg = f"Update {update}/{num_updates} | Step {self.global_step} | "
-                log_msg += f"Success: {stats['rollout/success_rate']:.2%} | "
-                log_msg += f"Trajectories: {stats.get('rollout/num_trajectories', 0)} | "
-                if "train/policy_loss" in stats:
-                    log_msg += f"Policy Loss: {stats['train/policy_loss']:.4f} | "
-                if "train/clipfrac" in stats:
-                    log_msg += f"Clip Frac: {stats['train/clipfrac']:.3f} | "
-                if "train/approx_kl" in stats:
-                    log_msg += f"KL: {stats['train/approx_kl']:.4f} | "
-                if "val/success_rate" in stats:
-                    log_msg += f"Val Success: {stats['val/success_rate']:.2%}"
-                tqdm.write(log_msg)  # Use tqdm.write to avoid progress bar disruption
-                
-                # Log to wandb with NaN filtering and error handling
-                if self.cfg.use_wandb:
-                    # Filter out NaN/inf values before logging
-                    clean_stats = {}
-                    for key, value in stats.items():
-                        if isinstance(value, (int, float)):
-                            if not (np.isnan(value) or np.isinf(value)):
-                                clean_stats[key] = value
+            # Log to wandb after every policy update
+            if self.cfg.use_wandb:
+                # Filter out NaN/inf values and convert lists/arrays to scalars
+                clean_stats = {}
+                for key, value in stats.items():
+                    # Convert lists/arrays to scalars by taking mean
+                    if isinstance(value, (list, np.ndarray)):
+                        if len(value) > 0:
+                            value = float(np.mean(value))
                         else:
-                            clean_stats[key] = value
+                            continue  # Skip empty lists
                     
-                    # Only log if we have valid stats
-                    if clean_stats:
-                        try:
-                            wandb.log(clean_stats, step=self.global_step)
-                            # Print confirmation for debugging
-                            if update % 10 == 0:  # Every 10 updates
-                                print(f"\n✓ Logged {len(clean_stats)} metrics to wandb at step {self.global_step}")
-                        except Exception as e:
-                            print(f"\n⚠️  WARNING: Failed to log to wandb: {e}")
-                    else:
-                        print(f"\n⚠️  WARNING: No valid stats to log (all NaN/inf)")
+                    # Now check if it's a valid scalar
+                    if isinstance(value, (int, float)):
+                        if not (np.isnan(value) or np.isinf(value)):
+                            clean_stats[key] = float(value)
+                    # Skip non-numeric values (strings, dicts, etc.)
+                
+                # Only log if we have valid stats
+                if clean_stats:
+                    try:
+                        wandb.log(clean_stats, step=self.global_step)
+                        # Print confirmation every 10 updates to avoid spam
+                        if update % 10 == 0:
+                            print(f"\n✓ Logged {len(clean_stats)} metrics to wandb at step {self.global_step}")
+                            print(f"   train/policy_loss={clean_stats.get('train/policy_loss', 'N/A')}, rollout/success_rate={clean_stats.get('rollout/success_rate', 'N/A')}")
+                    except Exception as e:
+                        print(f"\n⚠️  WARNING: Failed to log to wandb: {e}")
+                        if update % 10 == 0:  # Only print detailed debug every 10 updates
+                            print(f"   Stats types: {[(k, type(v)) for k, v in stats.items()][:5]}...")  # First 5 only
+                else:
+                    print(f"\n⚠️  WARNING: No valid stats to log (all NaN/inf) at update {update}")
             
             
             # Save checkpoint
@@ -1703,7 +1736,15 @@ class OpenVLAPPO:
         env.close()
         
         if self.cfg.use_wandb:
-            wandb.finish()
+            print("\n" + "="*70)
+            print("Finishing wandb run...")
+            print("="*70)
+            try:
+                wandb.finish()
+                print("✓ wandb run finished and synced to cloud")
+            except Exception as e:
+                print(f"⚠️  WARNING: Error finishing wandb: {e}")
+            print("="*70 + "\n")
         
         print("\n" + "="*70)
         print("Training completed!")

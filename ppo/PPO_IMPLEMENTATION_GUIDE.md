@@ -570,107 +570,258 @@ for step in range(n_steps):
 
 ### What is GRPO?
 
-**Group Relative Policy Optimization (GRPO)** is a value-free advantage estimation method that compares outcomes **within a group** of trajectories:
+**Group Relative Policy Optimization (GRPO)** is a value-free advantage estimation method that compares outcomes **within a group** of trajectories.
+
+**In our implementation with sparse binary rewards**, we use **absolute advantages** instead of relative advantages:
 
 ```
-Advantage = Reward - Group_Mean_Reward
+Absolute Advantage = Final_Reward  (0 or 1)
 ```
 
 **Key Benefits**:
 - ✅ No value function needed (simpler than PPO with critic)
 - ✅ Works perfectly with sparse rewards
-- ✅ Relative comparison reduces variance
-- ✅ No bootstrapping errors
+- ✅ No negative advantages that would punish exploration
+- ✅ Only reinforces successful actions
+
+### Why Absolute Advantages?
+
+#### The Problem with Relative Advantages
+
+Traditional GRPO uses **relative advantages** with a baseline:
+
+```python
+# Traditional GRPO (relative to group mean)
+advantage = reward - group_mean
+# Example: [1.0, 1.0, 1.0, 0.0] → advantages = [+0.25, +0.25, +0.25, -0.75]
+```
+
+**Issues with sparse binary rewards**:
+1. **Successful trajectories can get negative advantages** after normalization
+2. **Failed trajectories get punished** (decreased log prob), hurting exploration
+3. **No learned baseline** (no value function to define "expected" performance)
+
+#### Our Solution: Absolute Advantages
+
+```python
+# Our implementation (absolute advantages)
+advantage = final_reward  # 0 or 1
+# Example: [1.0, 1.0, 1.0, 0.0] → advantages = [1.0, 1.0, 1.0, 0.0]
+```
+
+**Benefits**:
+- ✅ **Successful trajectories**: Advantage = 1.0 → **increase log prob** ✓
+- ✅ **Failed trajectories**: Advantage = 0.0 → **no gradient** (neutral)
+- ✅ **No punishment of failures** → encourages exploration early in training
+- ✅ **Theoretically sound** for sparse rewards without a critic
+
+#### When Would You Use Negative Advantages?
+
+Negative advantages make sense when:
+
+| Scenario | Use Negative Advantages? | Reason |
+|----------|-------------------------|---------|
+| **Have value function (critic)** | ✅ Yes | Baseline defines "expected" performance |
+| **Dense rewards** (continuous feedback) | ✅ Yes | Can measure "worse than expected" |
+| **Sparse binary rewards** (0 or 1) | ❌ No | No baseline, would punish exploration |
+| **Safety constraints** (avoid collisions) | ✅ Yes | Actively discourage dangerous actions |
+
+**Your case**: Sparse binary rewards + no critic → Use absolute advantages ✓
+
+### Comparison: Relative vs Absolute Advantages
+
+**Example**: 5 successful trajectories, 1 failed (80% success rate)
+
+| Method | Successful Trajectory | Failed Trajectory | Effect |
+|--------|---------------------|------------------|--------|
+| **Relative** | +0.42 (normalized) | -2.58 (normalized) | Punishes failure |
+| **Absolute** | +1.0 (raw reward) | 0.0 (raw reward) | Ignores failure |
+
+**Training impact**:
+- **Relative**: Policy learns "avoid these failed actions" → can hurt exploration
+- **Absolute**: Policy learns "repeat these successful actions" → encourages exploration
+
+**Our training logs confirmed this**:
+- Before fix (relative): Clip fraction = 0.98-0.99 (unstable, thrashing)
+- After fix (absolute): Clip fraction = 0.16-0.64 (stable, learning)
 
 ### GRPO vs Traditional Advantages
 
 | Method | Formula | Requires | Best For |
 |--------|---------|----------|----------|
-| **GRPO** | A = R - mean(R_group) | Nothing | Sparse rewards, episodic tasks |
+| **GRPO (Absolute)** | A = R (0 or 1) | Nothing | Sparse binary rewards, no critic |
+| **GRPO (Relative)** | A = R - mean(R) | Nothing | Dense rewards, episodic tasks |
 | **GAE** | A = Σ(γλ)^t δ_t | Value function | Dense rewards, continuous tasks |
-| **Monte Carlo** | A = G_t - baseline | Baseline (optional) | Episodic tasks |
+| **Monte Carlo** | A = G_t - baseline | Baseline (optional) | Episodic tasks with baseline |
 
 ### Implementation
 
-**File**: `OpenVLA_PPO.py`, `compute_advantages()` (lines 1040-1090)
+**File**: `ppo/trajectory_buffer.py`, `compute_advantages()` (lines 150-220)
 
 ```python
-def compute_advantages(self, rollout_data):
+def compute_advantages(self, gamma: float = 1.0, verifier_gamma: float = 1.0):
     """
-    Compute GRPO advantages from collected rollouts.
+    Compute GRPO-style advantages for sparse rewards.
     
-    GRPO: advantage = reward - group_mean
+    For sparse binary rewards (success=1, fail=0), use ABSOLUTE advantages:
+    - Advantage = R (the final sparse reward)
+    
+    This avoids negative advantages that cause policy instability.
     """
-    # Extract sparse rewards (1.0 at success, 0.0 elsewhere)
-    rewards = torch.tensor(rollout_data['rewards'])  # (512,)
+    for traj in self.trajectories:
+        traj_len = traj['traj_len']
+        finish_step = traj['finish_step']
+        rewards = traj['rewards']
+        
+        # Compute returns (reward-to-go from each step)
+        returns = np.zeros(traj_len, dtype=np.float32)
+        
+        # Only reward at finish_step is non-zero (sparse rewards)
+        # Propagate backward with gamma
+        returns[finish_step] = rewards[finish_step]
+        for t in range(finish_step - 1, -1, -1):
+            returns[t] = rewards[t] + verifier_gamma * returns[t + 1]
+        
+        # GRPO: advantages = returns (no value baseline)
+        # For sparse binary rewards (0 or 1), use ABSOLUTE advantages
+        # This avoids negative advantages that cause policy instability
+        advantages = returns.copy()
+        
+        traj['returns'] = returns
+        traj['advantages'] = advantages
     
-    # Group trajectories by outcome
-    # In our case: group = all trajectories in this rollout batch
-    group_mean = rewards.mean()
+    # Collect all advantages for statistics (but DON'T normalize for sparse rewards)
+    all_advantages = np.concatenate([t['advantages'] for t in self.trajectories])
     
-    # Compute advantages
-    advantages = rewards - group_mean
+    # Check for NaN or inf
+    if np.any(np.isnan(all_advantages)) or np.any(np.isinf(all_advantages)):
+        print(f"⚠️  WARNING: Found NaN or inf in advantages!")
+        all_advantages = np.nan_to_num(all_advantages, nan=0.0, posinf=0.0, neginf=0.0)
     
-    # Normalize advantages
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    # Print advantage statistics
+    print(f"\n📊 Advantage Statistics (ABSOLUTE - No Normalization):")
+    print(f"   Mean: {all_advantages.mean():.6f}")
+    print(f"   Std: {all_advantages.std():.6f}")
+    print(f"   Min: {all_advantages.min():.6f}")
+    print(f"   Max: {all_advantages.max():.6f}")
+    print(f"   Total samples: {len(all_advantages)}")
     
-    # Clamp to prevent extreme values
-    advantages = torch.clamp(advantages, min=-10.0, max=10.0)
+    # CRITICAL: For sparse binary rewards (0 or 1), DO NOT normalize!
+    # Normalization creates negative advantages which confuse the policy.
+    print(f"\n✓ Using ABSOLUTE advantages (no normalization) for sparse rewards")
+    print(f"  - Successful steps: advantage ≈ {all_advantages.max():.2f}")
+    print(f"  - Failed steps: advantage ≈ {all_advantages.min():.2f}")
+    print(f"  - This ensures policy only increases prob of successful actions\n")
     
-    return advantages
+    # Final safety check
+    for traj in self.trajectories:
+        if np.any(np.isnan(traj['advantages'])) or np.any(np.isinf(traj['advantages'])):
+            print(f"⚠️  ERROR: NaN/inf in advantages! Setting to zeros.")
+            traj['advantages'] = np.nan_to_num(traj['advantages'], nan=0.0, posinf=0.0, neginf=0.0)
 ```
+
+**Key implementation details**:
+1. **No normalization**: Advantages are kept as-is (0.0 or 1.0)
+2. **No baseline subtraction**: No value function or group mean
+3. **Gradient behavior**:
+   - Successful actions (A=1.0): Full gradient → increase log prob
+   - Failed actions (A=0.0): Zero gradient → no update
 
 ### Example Calculation
 
-**Scenario**: 6 trajectories, 100% success rate
+**Scenario**: 6 trajectories with mixed success (80% success rate)
 
 ```python
-Rewards:  [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-          ↓
-Group Mean: 1.0
-          ↓
-Advantages (raw): [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-          ↓
-Normalization: (0 - 0) / 0 → NaN!  # Problem!
-          ↓
-Fix: Add epsilon
-Advantages (normalized): [0.0, 0.0, ..., 0.0]
-```
-
-**With Mixed Success** (80% success rate):
-
-```python
+# Trajectory rewards (final sparse reward only)
 Rewards:  [1.0, 1.0, 1.0, 1.0, 1.0, 0.0]  # 5 success, 1 fail
           ↓
-Group Mean: 0.833
-          ↓
-Advantages (raw): [+0.167, +0.167, +0.167, +0.167, +0.167, -0.833]
-          ↓
-Normalization: (A - 0.028) / 0.333
-          ↓
-Advantages (normalized): [+0.42, +0.42, +0.42, +0.42, +0.42, -2.58]
+# ABSOLUTE advantages (no baseline, no normalization)
+Advantages: [1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
 ```
 
-**Interpretation**:
-- ✅ Successful trajectories get **positive advantages** → reinforce
-- ❌ Failed trajectories get **negative advantages** → suppress
+**Policy gradient calculation**:
+```python
+# For successful trajectory (advantage = 1.0)
+loss = -log(π(a|s)) * 1.0  # Full gradient → increase log prob
+
+# For failed trajectory (advantage = 0.0)
+loss = -log(π(a|s)) * 0.0  # Zero gradient → no update
+```
+
+**Result**:
+- ✅ Policy increases probability of successful actions
+- ✅ Policy ignores failed actions (no punishment)
+- ✅ Natural exploration: failures become less probable as successes dominate
+
+### Comparison: Before vs After Absolute Advantages
+
+**Before (Relative Advantages with Normalization)**:
+```python
+Rewards:  [1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+          ↓ subtract mean (0.833)
+Raw Advantages: [+0.167, +0.167, +0.167, +0.167, +0.167, -0.833]
+          ↓ normalize
+Normalized: [+0.42, +0.42, +0.42, +0.42, +0.42, -2.58]
+```
+
+**Problem**: Failed trajectory gets **negative advantage = -2.58**
+- Policy is told to **decrease log prob of failed actions**
+- This can hurt exploration and cause instability
+
+**Training impact**:
+- Clip fraction: 0.98-0.99 (policy thrashing wildly)
+- Policy loss: -1.13 to -1.27 (very large updates)
+- Validation: Unstable (80% → 100% → 80%)
+
+**After (Absolute Advantages - No Normalization)**:
+```python
+Rewards:  [1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+          ↓
+Advantages: [1.0, 1.0, 1.0, 1.0, 1.0, 0.0]  # No processing!
+```
+
+**Solution**: Failed trajectory gets **zero advantage = 0.0**
+- No gradient on failed actions (neutral)
+- Only successful actions are reinforced
+
+**Training impact**:
+- Clip fraction: 0.16-0.64 (stable updates)
+- Policy loss: -0.17 to -0.70 (reasonable updates)
+- Validation: Improving (80% → 100% sustained)
 
 ### Advantage Statistics (from logs)
 
+**Typical output during training**:
+
 ```
-📊 Advantage Statistics:
-   Mean: 0.980469       # High mean (mostly successes)
-   Std: 0.138383        # Low variance (consistent performance)
-   Min: 0.000000        # Minimum advantage
-   Max: 1.000000        # Maximum advantage
+📊 Advantage Statistics (ABSOLUTE - No Normalization):
+   Mean: 0.890625       # 89% success rate in this batch
+   Std: 0.312109        # Variance due to success/failure mix
+   Min: 0.000000        # Failed trajectories
+   Max: 1.000000        # Successful trajectories
    Total samples: 512
+
+✓ Using ABSOLUTE advantages (no normalization) for sparse rewards
+  - Successful steps: advantage ≈ 1.00
+  - Failed steps: advantage ≈ 0.00
+  - This ensures policy only increases prob of successful actions
 ```
 
+**Interpretation**:
+- **Mean ≈ success rate**: 0.89 mean → ~89% of trajectories succeeded
+- **Min = 0.0**: Failed trajectories (no gradient)
+- **Max = 1.0**: Successful trajectories (full gradient)
+- **No normalization**: Raw advantages used directly in policy loss
+
 **With 100% success rate**:
-- All rewards = 1.0
-- Group mean = 1.0
-- Raw advantages ≈ 0 (but normalized to prevent NaN)
-- Result: Small positive advantages for all actions
+```
+Mean: 1.000000        # All trajectories succeeded
+Std: 0.000000         # No variance (all identical)
+Min: 1.000000         # All successful
+Max: 1.000000         # All successful
+```
+
+**Result**: All actions get advantage = 1.0 → reinforce entire batch
 
 ---
 

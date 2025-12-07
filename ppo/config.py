@@ -195,7 +195,7 @@ class PPOConfig:
     # Validation
     # ===========================================
     
-    val_interval: int = 1000
+    val_interval: int = 1024
     """Run validation every N environment steps (not updates).
     Validation runs val_episodes full episodes to measure success rate.
     - 1000-5000: Frequent validation, useful for debugging
@@ -227,13 +227,6 @@ class PPOConfig:
     - 'username': Logs to personal account
     - 'team-name': Logs to team workspace
     Set this if you want to log to a specific entity.
-    """
-    
-    log_interval: int = 100
-    """Print training stats every N environment steps.
-    Lower values give more frequent updates but clutter the console.
-    - 100-1000: Frequent logging
-    - 5000-10000: Less frequent, cleaner output
     """
     
     save_interval: int = 10000

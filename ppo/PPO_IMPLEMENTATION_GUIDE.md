@@ -14,14 +14,15 @@
 3. [VLA Actor Setup](#vla-actor-setup)
 4. [LoRA Adapter Configuration](#lora-adapter-configuration)
 5. [Training Phases: BC Warmup → RL](#training-phases-bc-warmup--rl)
-6. [Rollout Collection](#rollout-collection)
-7. [GRPO Advantage Computation](#grpo-advantage-computation)
-8. [Policy Loss Calculation](#policy-loss-calculation)
-9. [Gradient Protection & Clipping](#gradient-protection--clipping)
-10. [Policy Updates](#policy-updates)
-11. [Dual Validation System](#dual-validation-system)
-12. [Configuration Reference](#configuration-reference)
-13. [Troubleshooting](#troubleshooting)
+6. [Action Generation: From Model to Robot Commands](#action-generation-from-model-to-robot-commands)
+7. [Rollout Collection](#rollout-collection)
+8. [GRPO Advantage Computation](#grpo-advantage-computation)
+9. [Policy Loss Calculation](#policy-loss-calculation)
+10. [Gradient Protection & Clipping](#gradient-protection--clipping)
+11. [Policy Updates](#policy-updates)
+12. [Dual Validation System](#dual-validation-system)
+13. [Configuration Reference](#configuration-reference)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -797,7 +798,429 @@ use_l1_warmstart: bool = False    # No warmup, pure RL from scratch
 3. **Better Exploration**: Start from competent policy, explore improvements
 4. **On-Policy RL**: Eventually pure RL without teacher dependency
 
+---
 
+## Action Generation: From Model to Robot Commands
+
+This section explains how the OpenVLA model generates robot actions across all three training phases, covering both the L1 regression head and tokenized action prediction.
+
+### Core Architecture: Two Action Prediction Heads
+
+The OpenVLA model has **two separate mechanisms** for predicting actions:
+
+#### 1. L1 Regression Head (Direct Continuous Prediction)
+
+**Structure**: Linear layer `(768, 1)` that predicts continuous actions directly
+
+```python
+# Located in VLA model
+self.l1_action_head = nn.Linear(hidden_dim, 1)  # 768 → 1
+
+# Forward pass
+hidden_states = language_model(...).hidden_states[-1]  # (batch, seq, 768)
+action_embeddings = hidden_states[:, -56:, :]          # Last 56 tokens (8 actions × 7 dims)
+l1_actions = l1_action_head(action_embeddings)         # (batch, 56, 1)
+l1_actions = l1_actions.squeeze(-1).reshape(8, 7)      # (8, 7) continuous actions
+```
+
+**Properties**:
+- **High Quality**: ~80% success rate on LIBERO tasks (frozen, pre-trained)
+- **Fast**: Direct regression, no tokenization/detokenization overhead
+- **Frozen**: Not updated during PPO training, used only for rollout generation
+- **Deterministic**: No sampling, direct prediction
+
+#### 2. Tokenized Action Head (Language Model Vocabulary)
+
+**Structure**: Uses the **last 256 tokens** of the LLaMA vocabulary (tokens 31744-31999)
+
+```python
+# Extract action token logits
+full_logits = language_model(...).logits              # (batch, seq, 32000)
+action_logits = full_logits[:, -56:, -256:]           # (batch, 56, 256)
+# 56 positions = 8 actions × 7 dimensions per action
+# 256 bins = discretization of continuous range [-1, 1]
+```
+
+**Properties**:
+- **Trainable**: Updated with LoRA adapters during PPO
+- **Initially Poor**: Starts at ~0% success rate (random)
+- **Stochastic**: Samples from distribution during rollout
+- **Improves with RL**: Target is 80%+ success after training
+
+### Action Tokenization: Continuous ↔ Discrete Mapping
+
+The **action tokenizer** bridges continuous robot actions and discrete vocabulary tokens.
+
+#### Encoding: Continuous → Token IDs
+
+```python
+class ActionTokenizer:
+    def __init__(self, bins=256, min_action=-1, max_action=1):
+        # Create 256 uniform bins spanning [-1, 1]
+        self.bins = np.linspace(min_action, max_action, bins)         # 256 edges
+        self.bin_centers = (self.bins[:-1] + self.bins[1:]) / 2.0   # 255 centers
+        self.vocab_size = 32000  # LLaMA vocabulary
+    
+    def discretize_actions(self, continuous_actions):
+        """Convert continuous actions to token IDs."""
+        # 1. Clip to valid range
+        clipped = np.clip(continuous_actions, -1.0, 1.0)
+        
+        # 2. Find which bin each value falls into
+        bin_indices = np.digitize(clipped, self.bins)  # Returns [1, 256]
+        
+        # 3. Map to vocabulary token IDs (last 256 tokens)
+        token_ids = self.vocab_size - bin_indices      # [31744, 31999]
+        
+        return token_ids
+```
+
+**Example**:
+```python
+continuous_action = 0.37  # Continuous value in [-1, 1]
+bin_index = 185           # Found by np.digitize
+token_id = 32000 - 185    # = 31815 (vocab token ID)
+```
+
+#### Decoding: Token IDs → Continuous
+
+```python
+def decode_token_ids_to_actions(self, token_ids):
+    """Convert token IDs back to continuous actions."""
+    # 1. Convert token IDs to bin indices
+    bin_indices = self.vocab_size - token_ids  # [1, 256]
+    
+    # 2. Clip to valid bin center range [0, 254]
+    bin_indices = np.clip(bin_indices - 1, 0, 254)
+    
+    # 3. Lookup bin center values
+    continuous_actions = self.bin_centers[bin_indices]  # [-1, 1]
+    
+    return continuous_actions
+```
+
+**Key Properties**:
+- **Uniform Binning**: 256 bins evenly divide [-1, 1] → resolution ≈ 0.0078
+- **Vocabulary Mapping**: Last 256 tokens (31744-31999) represent actions
+- **Bidirectional**: Can convert both directions losslessly within bin resolution
+- **Per-Dimension**: Each of 7 action dimensions tokenized independently
+
+### Forward Pass: Vision + Language → Action Logits
+
+Complete walkthrough of how observations become action predictions:
+
+```python
+def predict_action_tokens_with_grad(obs, task_prompt, temperature=1.6):
+    """Full VLA forward pass to generate action token logits."""
+    
+    # === 1. Process Vision Input ===
+    image = obs['image']  # PIL Image or list of PIL Images
+    pixel_values = processor(task_prompt, image).pixel_values  # (1, num_images, C, H, W)
+    vision_features = vision_backbone(pixel_values)            # (1, num_patches, 768)
+    
+    # === 2. Process Language Input ===
+    prompt = f"In: What action should the robot take to {task_prompt.lower()}?\nOut:"
+    input_ids = tokenizer(prompt).input_ids                    # (1, prompt_len)
+    text_embeddings = language_model.embed(input_ids)          # (1, prompt_len, 768)
+    
+    # === 3. Process Proprioception (if available) ===
+    proprio = obs.get('proprio', None)  # (8,) robot joint positions
+    if proprio is not None:
+        proprio_tensor = torch.from_numpy(proprio)
+        proprio_emb = proprio_projector(proprio_tensor)        # (1, 768)
+        # Append to vision features
+        vision_features = torch.cat([vision_features, proprio_emb.unsqueeze(1)], dim=1)
+    
+    # === 4. Multimodal Fusion ===
+    # Concatenate vision patches and text embeddings
+    multimodal_embeddings = torch.cat([vision_features, text_embeddings], dim=1)
+    # Shape: (1, num_patches + prompt_len, 768)
+    
+    # === 5. Add Action Token Placeholders ===
+    # Prepare space for 56 action tokens (8 actions × 7 dims)
+    action_embeddings = torch.zeros(1, 56, 768)  # Will be filled by model
+    full_embeddings = torch.cat([multimodal_embeddings, action_embeddings], dim=1)
+    
+    # === 6. Forward Through Language Model ===
+    output = language_model(inputs_embeds=full_embeddings)
+    logits = output.logits  # (1, total_len, 32000)
+    
+    # === 7. Extract Action Token Logits ===
+    # Get logits for the 56 action token positions
+    num_patches = vision_features.shape[1]
+    prompt_len = text_embeddings.shape[1]
+    action_start = num_patches + prompt_len
+    action_end = action_start + 56
+    
+    action_logits_full = logits[:, action_start:action_end, :]  # (1, 56, 32000)
+    action_token_logits = action_logits_full[..., -256:]        # (1, 56, 256)
+    # Extract ONLY the last 256 tokens (action vocabulary)
+    
+    return action_token_logits  # (1, 56, 256)
+```
+
+**Key Dimensions**:
+- **56 token positions** = 8 actions × 7 dimensions per action
+- **256 bins** = discretization granularity for each dimension
+- **Action logits shape**: `(batch=1, sequence=56, vocab=256)`
+
+### Action Generation in Phase 1: BC Warmup
+
+**Rollout Collection** (execute L1 actions):
+
+```python
+def _get_action_l1_with_logprobs(obs, task_prompt):
+    """Execute L1 actions while computing tokenized log probs for PPO."""
+    
+    # === Get high-quality L1 actions (frozen head) ===
+    self.actor.vla.eval()
+    self.actor.l1_action_head.eval()
+    
+    with torch.no_grad():
+        # Use VLA's built-in predict_action with L1 head
+        l1_actions = vla_model.predict_action(
+            **inputs,
+            action_head=self.actor.l1_action_head,  # Use L1, not tokens
+            do_sample=False,  # Deterministic
+        )
+        # Returns: (8, 7) continuous actions in [-1, 1]
+    
+    # === Compute log probs from tokenized head (for PPO gradients) ===
+    # Get token logits with gradients enabled
+    action_data = predict_action_tokens_with_grad(obs, task_prompt)
+    
+    # Discretize L1 actions to target tokens
+    l1_flat = l1_actions.flatten()  # (56,)
+    target_token_ids = action_tokenizer.discretize_actions(l1_flat)  # (56,)
+    target_indices = target_token_ids - (vocab_size - 256)  # [0, 255]
+    
+    # Compute log probability of L1 actions under current token distribution
+    log_probs_per_token = logprobs_from_logits(
+        action_data['logits'],  # (1, 56, 256)
+        torch.from_numpy(target_indices)  # (56,)
+    )
+    log_prob = log_probs_per_token.mean()  # Mean over 56 tokens
+    
+    return l1_actions, {'log_prob': log_prob, 'l1_action': l1_actions, ...}
+```
+
+**Training Update** (cross-entropy loss):
+
+```python
+def _bc_update_from_l1(task_prompt):
+    """Train tokenized head to match L1 actions (behavior cloning)."""
+    
+    # Get stored L1 actions from buffer (ground truth)
+    l1_actions = buffer['l1_actions']  # (batch, 8, 7)
+    
+    for obs, l1_action_chunk in zip(observations, l1_actions):
+        # 1. Convert L1 actions to target token IDs
+        l1_flat = l1_action_chunk.flatten()  # (56,)
+        target_tokens = action_tokenizer.discretize_actions(l1_flat)
+        target_indices = target_tokens - (vocab_size - 256)  # [0, 255]
+        
+        # 2. Get tokenized head predictions (with gradients)
+        action_data = predict_action_tokens_with_grad(obs, task_prompt, sample=False)
+        logits = action_data['logits'][0]  # (56, 256)
+        
+        # 3. Compute cross-entropy loss
+        # Teaches tokenized head to predict same bins as L1
+        bc_loss = F.cross_entropy(
+            logits,           # (56, 256) predicted distributions
+            target_indices,   # (56,) target bins
+            reduction='mean'
+        )
+        
+        # 4. Backward pass
+        bc_loss.backward()
+    
+    optimizer.step()
+```
+
+**BC Accuracy Metric**:
+```python
+# Percentage of action bins correctly predicted
+predicted_bins = logits.argmax(dim=-1)  # (56,)
+accuracy = (predicted_bins == target_indices).float().mean()
+# Current: 14% → Target: 30%+ by step 25k
+```
+
+### Action Generation in Phase 2: Epsilon-Greedy Transition
+
+**Policy Selection**:
+
+```python
+def collect_rollouts(env, task_prompt):
+    """Collect experience with mixed L1/tokenized actions."""
+    
+    for step in range(n_steps):
+        # Decide which policy to use
+        if _should_use_l1_actions():
+            # Decreasing probability (100% → 0% over transition)
+            actions, info = _get_action_l1_with_logprobs(obs, task_prompt)
+        else:
+            # Increasing probability (0% → 100% over transition)
+            actions, info = _get_action_via_tokens(obs, task_prompt)
+        
+        # Execute in environment
+        next_obs, reward, done, _ = env.step(actions)
+        buffer.add(obs, actions, info['log_prob'], ...)
+```
+
+**Epsilon Decay Schedule**:
+```python
+# At step 25,000 (start transition): ε = 1.0 → 100% L1 actions
+# At step 27,500 (mid transition):   ε = 0.5 → 50% L1, 50% tokenized
+# At step 30,000 (end transition):   ε = 0.0 → 100% tokenized actions
+```
+
+**Training**: Switches from cross-entropy to **PPO loss** (uses advantages, not L1 targets)
+
+### Action Generation in Phase 3: Pure RL
+
+**Rollout Collection** (tokenized actions only):
+
+```python
+def _get_action_via_tokens(obs, task_prompt, temperature=1.6):
+    """Generate actions from tokenized head with stochastic sampling."""
+    
+    # === 1. Get action token logits with gradients ===
+    action_data = predict_action_tokens_with_grad(
+        obs, task_prompt,
+        temperature=temperature,  # 1.6 for exploration
+        sample=True               # Stochastic sampling
+    )
+    
+    action_token_logits = action_data['logits']  # (1, 56, 256)
+    
+    # === 2. Apply temperature and sample ===
+    scaled_logits = action_token_logits / temperature
+    probs = torch.softmax(scaled_logits, dim=-1)  # (1, 56, 256)
+    
+    # Sample 56 token indices from [0, 255]
+    probs_flat = probs.reshape(-1, 256)           # (56, 256)
+    sampled_indices = torch.multinomial(probs_flat, num_samples=1)  # (56, 1)
+    sampled_indices = sampled_indices.squeeze(-1)  # (56,)
+    
+    # === 3. Convert to vocabulary token IDs ===
+    token_ids = sampled_indices + (vocab_size - 256)  # [31744, 31999]
+    
+    # === 4. Compute log probabilities (for PPO) ===
+    log_probs_per_token = logprobs_from_logits(
+        action_token_logits,  # (1, 56, 256)
+        sampled_indices       # (56,)
+    )
+    log_prob = log_probs_per_token.mean()  # Mean over 56 tokens
+    
+    # === 5. Detokenize to continuous actions ===
+    token_ids_np = token_ids.detach().cpu().numpy()
+    bin_indices = vocab_size - token_ids_np           # [1, 256]
+    bin_indices = np.clip(bin_indices - 1, 0, 254)    # [0, 254]
+    continuous_actions = bin_centers[bin_indices]     # (56,) in [-1, 1]
+    actions_chunk = continuous_actions.reshape(8, 7)  # (8, 7)
+    
+    # === 6. Execute in environment ===
+    next_obs, reward, done, _ = env.step(actions_chunk)
+    
+    return actions_chunk, {
+        'log_prob': log_prob,
+        'responses': token_ids,
+        'continuous_actions': actions_chunk,
+        ...
+    }
+```
+
+**Training** (PPO loss):
+
+```python
+def update_policy():
+    """Update tokenized head with PPO loss."""
+    
+    # Get old actions from buffer
+    old_log_probs = buffer['log_probs']
+    old_token_ids = buffer['responses']
+    advantages = buffer['advantages']  # From GRPO
+    
+    for obs, old_tokens, old_log_prob, adv in minibatches:
+        # 1. Recompute log probs with current policy
+        action_data = predict_action_tokens_with_grad(obs, task_prompt)
+        
+        # Extract log prob of stored actions
+        new_log_probs = logprobs_from_logits(
+            action_data['logits'],
+            old_tokens  # Same actions, new probabilities
+        ).mean()
+        
+        # 2. Compute PPO ratio
+        log_ratio = new_log_prob - old_log_prob
+        ratio = torch.exp(log_ratio)
+        
+        # 3. Clipped surrogate loss
+        clipped_ratio = torch.clamp(ratio, 1-clip_eps, 1+clip_eps)
+        policy_loss = -torch.min(ratio * adv, clipped_ratio * adv)
+        
+        # 4. Backward pass
+        policy_loss.backward()
+    
+    optimizer.step()
+```
+
+### Action Chunking: 8 Actions Per Forward Pass
+
+**Motivation**: Temporal consistency and efficiency
+
+```python
+# Single forward pass predicts 8 consecutive actions
+action_chunk = model(obs, prompt)  # Shape: (8, 7)
+
+# Execute all 8 actions before next forward pass
+for action in action_chunk:
+    obs, reward, done, _ = env.step(action)
+    if done:
+        break
+```
+
+**Benefits**:
+1. **8× Fewer Forward Passes**: Reduces compute overhead
+2. **Temporal Consistency**: Actions planned together, smoother trajectories
+3. **Faster Rollout Collection**: ~1.5-2× speedup in practice
+4. **Preserved Across Phases**: Both L1 and tokenized use same chunking
+
+**Token Positions**:
+```
+Tokens 0-27:     Vision patches (image features)
+Tokens 28-42:    Text prompt ("What action should...")
+Tokens 43-98:    Action tokens (8 actions × 7 dims = 56 tokens)
+```
+
+### Summary: Action Generation Comparison
+
+| Aspect | L1 Regression Head | Tokenized Action Head |
+|--------|-------------------|----------------------|
+| **Architecture** | Linear layer (768 → 1) | Last 256 vocab tokens |
+| **Training** | Frozen (pre-trained) | LoRA adapters (trainable) |
+| **Quality** | High (80% success) | Low → High (0% → 80%+) |
+| **Speed** | Fast (direct) | Moderate (tokenize + detokenize) |
+| **Usage** | Phase 1-2 rollouts | Phase 2-3 rollouts, all training |
+| **Loss Function** | N/A (frozen) | Cross-entropy (Phase 1), PPO (Phase 2-3) |
+| **Stochasticity** | Deterministic | Stochastic (temperature sampling) |
+| **Output** | Continuous (8, 7) | Token IDs → Continuous (8, 7) |
+| **Gradients** | Disabled | Enabled (for RL updates) |
+
+### Validation: Dual Evaluation System
+
+Both heads evaluated separately to track learning progress:
+
+```python
+# L1 baseline (frozen, should stay ~80%)
+l1_success_rate = evaluate_policy(use_builtin_predict=True, use_l1_head=True)
+
+# Tokenized head (improving 0% → 80%+)
+tokenized_success_rate = evaluate_policy(use_builtin_predict=True, use_l1_head=False)
+
+# Performance gap (should close over training)
+gap = l1_success_rate - tokenized_success_rate  # Target: <20% by 100k steps
+```
 
 ---
 

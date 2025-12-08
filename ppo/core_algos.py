@@ -26,17 +26,20 @@ def logprobs_from_logits(
     # Clamp logits to prevent extreme values that cause overflow
     # Range [-100, 100] is safe for log_softmax computation
     logits = torch.clamp(logits, min=-100.0, max=100.0)
-    
+
     # Compute log softmax
     log_probs_all = F.log_softmax(logits, dim=-1)
-    
+
+    # Assert shapes for safety
+    assert log_probs_all.shape[:-1] == token_ids.shape, f"Shape mismatch: log_probs_all {log_probs_all.shape}, token_ids {token_ids.shape}"
+
     # Gather log probs for specific tokens
     log_probs = torch.gather(log_probs_all, dim=-1, index=token_ids.unsqueeze(-1)).squeeze(-1)
-    
+
     # Clamp log probs to prevent extreme values
     # log(1e-10) ≈ -23, so [-50, 0] is a safe range
     log_probs = torch.clamp(log_probs, min=-50.0, max=0.0)
-    
+
     return log_probs
 
 

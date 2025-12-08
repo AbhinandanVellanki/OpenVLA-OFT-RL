@@ -8,10 +8,13 @@ import numpy as np
 import torch
 from pathlib import Path
 import sys
+import os
 
 # Add paths
 vla_oft_path = Path(__file__).parent / "vla-oft"
 sys.path.insert(0, str(vla_oft_path))
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../vla_oft')))
 
 from min_vla.action_tokenizer import ActionTokenizer
 from ppo.trajectory_buffer import TrajectoryBuffer
@@ -60,72 +63,77 @@ def test_trajectory_buffer():
     
     buffer = TrajectoryBuffer()
     print("✓ Initialized TrajectoryBuffer")
-    
-    # Simulate 2 trajectories with different lengths
-    trajectory_lengths = [50, 30]
+
+    # Simulate 3 trajectories with random lengths, some ending with partial chunks
+    rng = np.random.default_rng(42)
+    trajectory_lengths = [17, 8, 13]  # All less than 24, so some partial chunks
     device = torch.device("cpu")
-    
+
     for traj_idx, traj_len in enumerate(trajectory_lengths):
-        print(f"\nSimulating trajectory {traj_idx+1} (length={traj_len})...")
-        
-        for step in range(traj_len):
-            # Dummy data
-            obs = {"image": np.zeros((224, 224, 3), dtype=np.uint8), "proprio": np.zeros(8)}
-            responses = torch.randint(31744, 32000, (56,))  # 7 dims * 8 chunk
-            input_ids = torch.randint(0, 32000, (1, 50))
-            attention_mask = torch.ones((1, 50))
-            pixel_values = torch.randn((1, 3, 224, 224))
-            proprio = np.zeros(8)
-            action = np.random.uniform(-1, 1, 7)
-            
-            # Sparse reward: only at end
-            reward = 1.0 if step == traj_len - 1 else 0.0
-            done = (step == traj_len - 1)
-            value = 0.5
-            log_prob = torch.tensor(-2.0)
-            
-            buffer.add(
-                obs=obs,
-                responses=responses,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                proprio=proprio,
-                action=action,
-                reward=reward,
-                done=done,
-                value=value,
-                old_log_prob=log_prob,
-            )
-    
-    print(f"\n✓ Added {len(buffer)} trajectories")
-    
-    # Test trajectory mask generation
-    mask1 = buffer.generate_traj_mask(50, 49, device)
-    mask2 = buffer.generate_traj_mask(30, 29, device)
-    
-    assert mask1.sum() == 50, f"Mask1 wrong size: {mask1.sum()}"
-    assert mask2.sum() == 30, f"Mask2 wrong size: {mask2.sum()}"
-    print("✓ Trajectory masks generated correctly")
-    
+        print(f"\nSimulating stochastic trajectory {traj_idx+1} (length={traj_len})...")
+        step = 0
+        while step < traj_len:
+            # Determine chunk size: full (8) or partial (remaining)
+            chunk_size = min(8, traj_len - step)
+            # Dummy data for chunk
+            for i in range(chunk_size):
+                obs = {"image": np.zeros((224, 224, 3), dtype=np.uint8), "proprio": np.zeros(8)}
+                responses = torch.randint(31744, 32000, (7,))  # 7 dims per action
+                input_ids = torch.randint(0, 32000, (1, 50))
+                attention_mask = torch.ones((1, 50))
+                pixel_values = torch.randn((1, 3, 224, 224))
+                proprio = np.zeros(8)
+                action = np.random.uniform(-1, 1, 7)
+                reward = 1.0 if (step + i) == traj_len - 1 else 0.0
+                done = ((step + i) == traj_len - 1)
+                value = 0.5
+                log_prob = torch.tensor(-2.0)
+                buffer.add(
+                    obs=obs,
+                    responses=responses,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=pixel_values,
+                    proprio=proprio,
+                    action=action,
+                    l1_action=None,  # Stochastic rollout
+                    reward=reward,
+                    done=done,
+                    value=value,
+                    old_log_prob=log_prob,
+                )
+            step += chunk_size
+
+    print(f"\n✓ Added {len(buffer)} stochastic trajectories with variable chunk sizes")
+
+    # Test trajectory mask generation for each trajectory
+    for idx, traj in enumerate(buffer.trajectories):
+        mask = buffer.generate_traj_mask(traj['traj_len'], traj['finish_step'], device)
+        assert mask.sum() == traj['traj_len'], f"Mask wrong size for trajectory {idx}: {mask.sum()}"
+    print("✓ Trajectory masks generated correctly for all trajectories")
+
     # Compute advantages
     buffer.compute_advantages(gamma=0.99, verifier_gamma=1.0)
     print("✓ GRPO advantages computed")
-    
+
     # Get data
     data = buffer.get()
-    
+
     print(f"\nBuffer statistics:")
     print(f"  - Total steps: {len(data['observations'])}")
-    print(f"  - Responses shape: {data['responses'].shape}")
     print(f"  - Actions shape: {data['actions'].shape}")
     print(f"  - Advantages shape: {data['advantages'].shape}")
     print(f"  - Rewards (non-zero): {(data['rewards'] != 0).sum()}/{len(data['rewards'])}")
-    
-    assert len(data['observations']) == 80, "Wrong total steps!"
-    assert (data['rewards'] != 0).sum() == 2, "Wrong number of non-zero rewards!"
-    
-    print("✅ TrajectoryBuffer tests passed!")
+
+    # Check that total steps matches sum of trajectory lengths
+    expected_steps = sum(trajectory_lengths)
+    assert len(data['observations']) == expected_steps, f"Wrong total steps! Expected {expected_steps}, got {len(data['observations'])}"
+    assert (data['rewards'] != 0).sum() == len(trajectory_lengths), f"Wrong number of non-zero rewards!"
+
+    # Check that actions shape matches expected (variable chunks)
+    assert data['actions'].shape[0] == expected_steps, f"Actions shape mismatch!"
+
+    print("✅ Stochastic TrajectoryBuffer variable chunk tests passed!")
 
 
 def test_ppo_algorithms():

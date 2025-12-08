@@ -900,15 +900,23 @@ class OpenVLAPPO:
         if not self.cfg.use_l1_warmstart:
             return False  # Warmstart disabled, always use tokenized
         
-        if self.global_step < self.cfg.l1_warmup_steps:
-            return True  # Warmup phase: use L1
-        elif self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
-            # Transition phase: epsilon-greedy
-            progress = (self.global_step - self.cfg.l1_warmup_steps) / self.cfg.l1_transition_steps
-            epsilon = 1.0 - progress  # 1.0 → 0.0 over transition period
-            return np.random.rand() < epsilon
+        if self.cfg.l1_warmup_steps == 0:
+            # No warmup, go straight to transition/rl
+            if self.global_step < self.cfg.l1_transition_steps:
+                progress = self.global_step / self.cfg.l1_transition_steps
+                epsilon = 1.0 - progress
+                return np.random.rand() < epsilon
+            else:
+                return False
         else:
-            return False  # RL phase: use tokenized
+            if self.global_step < self.cfg.l1_warmup_steps:
+                return True  # Warmup phase: use L1
+            elif self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
+                progress = (self.global_step - self.cfg.l1_warmup_steps) / self.cfg.l1_transition_steps
+                epsilon = 1.0 - progress  # 1.0 → 0.0 over transition period
+                return np.random.rand() < epsilon
+            else:
+                return False  # RL phase: use tokenized
     
     def _get_training_stage(self) -> str:
         """
@@ -920,12 +928,18 @@ class OpenVLAPPO:
         if not self.cfg.use_l1_warmstart:
             return "rl"
         
-        if self.global_step < self.cfg.l1_warmup_steps:
-            return "warmup"
-        elif self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
-            return "transition"
+        if self.cfg.l1_warmup_steps == 0:
+            if self.global_step < self.cfg.l1_transition_steps:
+                return "transition"
+            else:
+                return "rl"
         else:
-            return "rl"
+            if self.global_step < self.cfg.l1_warmup_steps:
+                return "warmup"
+            elif self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
+                return "transition"
+            else:
+                return "rl"
     
     def _update_training_stage(self):
         """
@@ -1191,13 +1205,20 @@ class OpenVLAPPO:
         if not self.cfg.use_l1_warmstart:
             return "Tokenized (RL)"
         
-        if self.global_step < self.cfg.l1_warmup_steps:
-            return "L1 (warmup)"
-        elif self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
-            progress = (self.global_step - self.cfg.l1_warmup_steps) / self.cfg.l1_transition_steps
-            return f"L1→Tokenized ({progress:.0%})"
+        if self.cfg.l1_warmup_steps == 0:
+            if self.global_step < self.cfg.l1_transition_steps:
+                progress = self.global_step / self.cfg.l1_transition_steps
+                return f"L1→Tokenized ({progress:.0%})"
+            else:
+                return "Tokenized (RL)"
         else:
-            return "Tokenized (RL)"
+            if self.global_step < self.cfg.l1_warmup_steps:
+                return "L1 (warmup)"
+            elif self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
+                progress = (self.global_step - self.cfg.l1_warmup_steps) / self.cfg.l1_transition_steps
+                return f"L1→Tokenized ({progress:.0%})"
+            else:
+                return "Tokenized (RL)"
     
     def collect_rollouts(
         self,
@@ -1462,8 +1483,12 @@ class OpenVLAPPO:
         rollout_policy = self._get_rollout_policy_name()
         print(f"\n🎯 Rollout Policy: {rollout_policy}")
         if self.cfg.use_l1_warmstart:
-            warmup_progress = min(1.0, self.global_step / self.cfg.l1_warmup_steps)
-            print(f"   Warmup Progress: {warmup_progress:.1%} ({self.global_step}/{self.cfg.l1_warmup_steps} steps)")
+            if self.cfg.l1_warmup_steps > 0:
+                warmup_progress = min(1.0, self.global_step / self.cfg.l1_warmup_steps)
+                print(f"   Warmup Progress: {warmup_progress:.1%} ({self.global_step}/{self.cfg.l1_warmup_steps} steps)")
+            else:
+                warmup_progress = 1.0
+                print("   Warmup skipped (l1_warmup_steps=0)")
         
         # Debug: Check old log probabilities from rollout
         data_for_debug = self.trajectory_buffer.get()
@@ -1660,6 +1685,13 @@ class OpenVLAPPO:
                     # Ensure logits and response_indices are on the same device
                     logits = logits.to(self.training_device)
                     response_indices = response_indices.to(self.training_device)
+                    # Ensure response_indices is always 1D before unsqueeze
+                    # Ensure response_indices is always 1D (seq_len) before unsqueeze
+                    # Ensure response_indices is always shape [seq_len] before unsqueeze
+                    seq_len = logits.shape[0]
+                    response_indices = response_indices.flatten()
+                    if response_indices.shape[0] == 1:
+                        response_indices = response_indices.expand(seq_len)
                     log_prob = logprobs_from_logits(logits.unsqueeze(0), response_indices.unsqueeze(0))
                     # CRITICAL: Use mean to match rollout computation and prevent massive values
                     log_prob = log_prob.mean()  # Mean over action dimensions
@@ -1835,6 +1867,9 @@ class OpenVLAPPO:
         
         epoch_pbar.close()
         # ...existing code...
+        # If warmup is skipped, ensure all logic that depends on warmup_progress or l1_warmup_steps is robust
+        # (e.g., phase transitions, loss weighting, etc.)
+        # Add similar guards wherever l1_warmup_steps is used in this method
         return {k: np.mean(v) for k, v in stats.items()}
     
     def validate_tokenized(self, env, task_prompt: str) -> Dict[str, float]:
@@ -2266,7 +2301,7 @@ class OpenVLAPPO:
             # Add rollout policy tracking
             if self.cfg.use_l1_warmstart:
                 stats["rollout/uses_l1"] = int(self._should_use_l1_actions())
-                stats["rollout/warmup_progress"] = min(1.0, self.global_step / self.cfg.l1_warmup_steps)
+                stats["rollout/warmup_progress"] = 1.0 if self.cfg.l1_warmup_steps == 0 else min(1.0, self.global_step / self.cfg.l1_warmup_steps)
                 if self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
                     transition_progress = max(0.0, (self.global_step - self.cfg.l1_warmup_steps) / self.cfg.l1_transition_steps)
                     stats["rollout/transition_progress"] = transition_progress

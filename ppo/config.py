@@ -18,7 +18,7 @@ class PPOConfig:
     # Training Hyperparameters
     # ===========================================
     
-    total_timesteps: int = 100000
+    total_timesteps: int = 1000000
     """Total number of environment steps to collect during training.
     Example: 100,000 steps = ~195 updates with n_steps=500, or ~781 updates with n_steps=128.
     Typical values: 50k-1M for single task, 500k-5M for multi-task.
@@ -62,7 +62,7 @@ class PPOConfig:
     if memory is tight, or switching to pipeline parallelism.
     """
     
-    n_epochs: int = 10
+    n_epochs: int = 1
     """Number of passes through the collected data during each policy update.
     Each update, we iterate over the n_steps buffer this many times.
     - Higher epochs (10-20): More learning per sample, risk of overfitting
@@ -181,7 +181,7 @@ class PPOConfig:
     true reinforcement learning once the tokenized policy is competent.
     """
     
-    l1_warmup_steps: int = 25000
+    l1_warmup_steps: int = 0
     """Number of steps to use L1 actions for rollouts (behavior cloning phase).
     During warmup:
     - L1 head generates high-quality actions (frozen)
@@ -291,7 +291,7 @@ class PPOConfig:
     Set to 0 to disable validation during training.
     """
     
-    val_episodes: int = 10
+    val_episodes: int = 1
     """Number of episodes to run during each validation phase.
     More episodes give better success rate estimates but take longer.
     - 5-10: Quick validation

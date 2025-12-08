@@ -96,6 +96,21 @@ class TrajectoryBuffer:
                 padded_input_ids.append(ids)
                 padded_attention_masks.append(mask)
             
+            # Pad l1_actions to consistent shape before stacking
+            if any(a is not None for a in self.current_trajectory['l1_actions']):
+                expected_shape = (self.action_chunk, self.action_dim) if hasattr(self, 'action_chunk') and hasattr(self, 'action_dim') else None
+                def pad_action(a):
+                    if a is None:
+                        return np.zeros(expected_shape, dtype=np.float32) if expected_shape else np.zeros_like(self.current_trajectory['l1_actions'][0])
+                    if expected_shape and a.shape != expected_shape:
+                        pad_width = [(0, expected_shape[i] - a.shape[i]) for i in range(len(expected_shape))]
+                        return np.pad(a, pad_width, mode='constant')
+                    return a
+                padded_actions = [pad_action(a) for a in self.current_trajectory['l1_actions']]
+                l1_actions = np.stack(padded_actions)
+            else:
+                l1_actions = None
+
             trajectory = {
                 'observations': self.current_trajectory['observations'].copy(),
                 'responses': torch.stack(self.current_trajectory['responses']).detach(),
@@ -104,7 +119,14 @@ class TrajectoryBuffer:
                 'pixel_values': torch.stack(self.current_trajectory['pixel_values']).detach(),
                 'proprio': np.stack(self.current_trajectory['proprio']) if self.current_trajectory['proprio'][0] is not None else None,
                 'actions': np.stack(self.current_trajectory['actions']),
-                'l1_actions': np.stack(self.current_trajectory['l1_actions']) if any(a is not None for a in self.current_trajectory['l1_actions']) else None,
+                'l1_actions': l1_actions,
+                # ...existing code...
+            }
+
+            trajectory = {
+                # ...existing code...
+                'l1_actions': l1_actions,
+                # ...existing code...
                 'rewards': np.array(self.current_trajectory['rewards']),
                 'dones': np.array(self.current_trajectory['dones']),
                 'values': np.array(self.current_trajectory['values']),
@@ -144,6 +166,17 @@ class TrajectoryBuffer:
                 padded_input_ids.append(ids)
                 padded_attention_masks.append(mask)
             
+            # Robust l1_actions stacking: only if all are not None and shapes match
+            l1_actions_list = self.current_trajectory['l1_actions']
+            if l1_actions_list and all(a is not None for a in l1_actions_list):
+                shapes = [np.shape(a) for a in l1_actions_list]
+                if all(s == shapes[0] for s in shapes):
+                    l1_actions = np.stack(l1_actions_list)
+                else:
+                    l1_actions = None
+            else:
+                l1_actions = None
+
             trajectory = {
                 'observations': self.current_trajectory['observations'].copy(),
                 'responses': torch.stack(self.current_trajectory['responses']).detach(),
@@ -152,7 +185,7 @@ class TrajectoryBuffer:
                 'pixel_values': torch.stack(self.current_trajectory['pixel_values']).detach(),
                 'proprio': np.stack(self.current_trajectory['proprio']) if self.current_trajectory['proprio'][0] is not None else None,
                 'actions': np.stack(self.current_trajectory['actions']),
-                'l1_actions': np.stack(self.current_trajectory['l1_actions']) if any(a is not None for a in self.current_trajectory['l1_actions']) else None,
+                'l1_actions': l1_actions,
                 'rewards': np.array(self.current_trajectory['rewards']),
                 'dones': np.array(self.current_trajectory['dones']),
                 'values': np.array(self.current_trajectory['values']),
@@ -260,47 +293,95 @@ class TrajectoryBuffer:
     def get(self) -> Dict[str, Any]:
         """
         Get all stored trajectories as a dictionary.
-        
+        Handles partial chunks robustly: only executed actions are returned, and variable-length chunks are supported.
         Returns:
             data: Dictionary containing all trajectory data
         """
+        import torch
+        import numpy as np
         if not self.trajectories:
             return {
                 'observations': [],
-                'responses': [],
-                'input_ids': [],
-                'attention_mask': [],
-                'pixel_values': [],
-                'proprio': [],
-                'actions': [],
-                'rewards': [],
-                'returns': [],
-                'advantages': [],
-                'old_log_probs': [],
+                'responses': torch.empty(0),
+                'input_ids': torch.empty(0, dtype=torch.long),
+                'attention_mask': torch.empty(0, dtype=torch.long),
+                'pixel_values': torch.empty(0),
+                'proprio': np.empty((0,)),
+                'actions': np.empty((0,)),
+                'l1_actions': np.empty((0,)),
+                'rewards': np.empty((0,)),
+                'returns': np.empty((0,)),
+                'advantages': np.empty((0,)),
+                'old_log_probs': torch.empty(0),
                 'finish_steps': [],
-                'traj_lens': [],
+                'traj_lens': []
             }
-        
-        # Flatten trajectories into single arrays
-        data = {
-            'observations': [obs for traj in self.trajectories for obs in traj['observations']],
-            'responses': torch.cat([traj['responses'] for traj in self.trajectories]),
-            'input_ids': torch.cat([traj['input_ids'] for traj in self.trajectories]),
-            'attention_mask': torch.cat([traj['attention_mask'] for traj in self.trajectories]),
-            'pixel_values': torch.cat([traj['pixel_values'] for traj in self.trajectories]),
-            'proprio': np.concatenate([traj['proprio'] for traj in self.trajectories if traj['proprio'] is not None]) if self.trajectories[0]['proprio'] is not None else None,
-            'actions': np.concatenate([traj['actions'] for traj in self.trajectories]),
-            'l1_actions': np.concatenate([traj['l1_actions'] for traj in self.trajectories if traj['l1_actions'] is not None]) if any(traj['l1_actions'] is not None for traj in self.trajectories) else None,
-            'rewards': np.concatenate([traj['rewards'] for traj in self.trajectories]),
-            'returns': np.concatenate([traj['returns'] for traj in self.trajectories]),
-            'advantages': np.concatenate([traj['advantages'] for traj in self.trajectories]),
-            'old_log_probs': torch.cat([traj['old_log_probs'] for traj in self.trajectories]),
-            'finish_steps': [traj['finish_step'] for traj in self.trajectories],
-            'traj_lens': [traj['traj_len'] for traj in self.trajectories],
-        }
-        
-        return data
+                        'old_log_probs': torch.empty(0),
+                        'finish_steps': [],
+                        'traj_lens': []
+                    }
+        """
+        Get all stored trajectories as a dictionary.
+        Handles partial chunks robustly: only executed actions are returned, and variable-length chunks are supported.
+        Returns:
+            data: Dictionary containing all trajectory data
+        """
+
+        if not self.trajectories:
+            import torch
+            import numpy as np
+            return {
+                'observations': [],
+                'responses': torch.empty(0),
+                'input_ids': torch.empty(0, dtype=torch.long),
+                'attention_mask': torch.empty(0, dtype=torch.long),
+                'pixel_values': torch.empty(0),
+                'proprio': np.empty((0,)),
+                'actions': np.empty((0,)),
+                'l1_actions': np.empty((0,)),
+                'rewards': np.empty((0,)),
+                'returns': np.empty((0,)),
+                'advantages': np.empty((0,)),
+                'old_log_probs': torch.empty(0),
+                'finish_steps': [],
+                'traj_lens': []
+            }
+
+        # Pad sequence tensors to max length for cat
+        def pad_sequence_list(seq_list, pad_value=0):
+            # seq_list: list of tensors of the same rank, but possibly different shape in any dimension
+            # Pad all dimensions to the max size in that dimension across the batch
+            # Example: for 3D tensors, pad (D0, D1, D2) to (max0, max1, max2)
+            import torch
+            max_shape = []
+            ndims = seq_list[0].ndim
+            for d in range(ndims):
+                max_shape.append(max(x.shape[d] for x in seq_list))
+            padded = []
+            for x in seq_list:
+                pad_widths = []
+                for d in reversed(range(ndims)):
+                    pad_amt = max_shape[d] - x.shape[d]
+                    pad_widths.extend([0, pad_amt])  # pad only on the right
+                x = torch.nn.functional.pad(x, pad_widths, value=pad_value)
+                padded.append(x)
+            return torch.stack(padded, dim=0)
+
+            trajectory = {
+                'observations': self.current_trajectory['observations'].copy(),
+                'responses': torch.stack(self.current_trajectory['responses']).detach(),
+                'input_ids': torch.stack(padded_input_ids).detach(),
+                'attention_mask': torch.stack(padded_attention_masks).detach(),
+                'pixel_values': torch.stack(self.current_trajectory['pixel_values']).detach(),
+                'proprio': np.stack(self.current_trajectory['proprio']) if self.current_trajectory['proprio'][0] is not None else None,
+                'actions': np.stack(self.current_trajectory['actions']),
+                'l1_actions': l1_actions,
+                'rewards': np.array(self.current_trajectory['rewards']),
+                'dones': np.array(self.current_trajectory['dones']),
+                'values': np.array(self.current_trajectory['values']),
+                'old_log_probs': torch.stack(self.current_trajectory['old_log_probs']).detach(),
+                'finish_step': self.episode_step - 1,
+                'traj_len': self.episode_step
+            }
+            self.trajectories.append(trajectory)
     
-    def __len__(self) -> int:
-        """Return total number of complete trajectories."""
-        return len(self.trajectories)

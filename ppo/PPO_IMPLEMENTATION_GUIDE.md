@@ -33,9 +33,9 @@ This guide documents our implementation of **Group Relative Policy Optimization 
 - **OpenVLA-7B**: Pre-trained vision-language-action model (7.6B parameters)
 - **LoRA Adapters**: Low-rank adaptation for efficient fine-tuning (~55M trainable params)
 - **GRPO**: Value-free advantage estimation using group relative outcomes
-- **Action Tokenization**: 256-bin discretization of continuous actions
-- **Behavior Cloning Warmup**: Train tokenized head to match L1 actions (cross-entropy loss)
-- **Phased Training**: BC warmup → epsilon-greedy transition → pure RL
+- **Action Tokenization**: 256-bin discretization of continuous actions via last 256 vocab tokens
+- **Self-Distillation Warmup**: Train stochastic policy to match greedy policy (cross-entropy loss)
+- **Phased Training**: Greedy warmstart → epsilon-greedy transition → stochastic RL
 - **Sparse Rewards**: Binary success/failure at episode completion
 - **Action Chunking**: 8 actions per forward pass (temporal consistency)
 - **Multi-GPU Support**: DataParallel for 2x speedup on dual GPUs
@@ -44,10 +44,10 @@ This guide documents our implementation of **Group Relative Policy Optimization 
 
 - **Working Training Loop**: Successfully trains with finite losses and updating metrics
 - **LoRA Integration**: Base 7B backbone frozen, 55.4M LoRA adapters trainable (0.73%)
-- **Behavior Cloning Warmup**: Train tokenized head to match L1 (cross-entropy loss, 0-25k steps)
-- **Phased Transition**: Warmup → epsilon-greedy transition → pure RL
+- **Self-Distillation Warmup**: Stochastic learns from greedy (0-25k steps, cross-entropy loss)
+- **Phased Transition**: Greedy warmstart → epsilon-greedy → pure stochastic RL
 - **Action Chunking**: One forward pass = 8 actions (efficiency + temporal consistency)
-- **Dual Validation**: Track both L1 and tokenized head performance separately
+- **Dual Validation**: Track both greedy baseline and stochastic policy separately
 - **Gradient Stability**: Clipping and skip thresholds prevent catastrophic explosions
 - **Memory Efficient**: ~18-19GB on single GPU, ~18-20GB per GPU with DataParallel
 - **Multi-GPU Support**: DataParallel for 1.8-2.3x speedup on 2 GPUs
@@ -802,50 +802,69 @@ use_l1_warmstart: bool = False    # No warmup, pure RL from scratch
 
 ## Action Generation: From Model to Robot Commands
 
-This section explains how the OpenVLA model generates robot actions across all three training phases, covering both the L1 regression head and tokenized action prediction.
+**IMPORTANT CLARIFICATION**: Despite the code and configuration referring to "L1 actions" and "`use_l1_warmstart`", there is **NO separate L1 regression head** in this implementation ([`load_l1_action_head=False`](OpenVLA-OFT-RL/vla_oft/min_vla/config.py)). The "L1 actions" are actually **greedy tokenized actions** (deterministic argmax from the pretrained VLA). This is a naming artifact from earlier versions.
 
-### Core Architecture: Two Action Prediction Heads
+**What's Really Happening:**
+- **Teacher**: Greedy tokenized actions (`do_sample=False`, argmax, 80% success)
+- **Student**: Stochastic tokenized actions (`sample=True`, temperature sampling, 0%→80%+)
+- **Method**: Self-distillation within the same tokenized action mechanism
 
-The OpenVLA model has **two separate mechanisms** for predicting actions:
+---
 
-#### 1. L1 Regression Head (Direct Continuous Prediction)
+This section explains how the OpenVLA model generates robot actions using **tokenized action prediction**.
 
-**Structure**: Linear layer `(768, 1)` that predicts continuous actions directly
+### Core Architecture: Tokenized Action Prediction
 
-```python
-# Located in VLA model
-self.l1_action_head = nn.Linear(hidden_dim, 1)  # 768 → 1
-
-# Forward pass
-hidden_states = language_model(...).hidden_states[-1]  # (batch, seq, 768)
-action_embeddings = hidden_states[:, -56:, :]          # Last 56 tokens (8 actions × 7 dims)
-l1_actions = l1_action_head(action_embeddings)         # (batch, 56, 1)
-l1_actions = l1_actions.squeeze(-1).reshape(8, 7)      # (8, 7) continuous actions
-```
-
-**Properties**:
-- **High Quality**: ~80% success rate on LIBERO tasks (frozen, pre-trained)
-- **Fast**: Direct regression, no tokenization/detokenization overhead
-- **Frozen**: Not updated during PPO training, used only for rollout generation
-- **Deterministic**: No sampling, direct prediction
-
-#### 2. Tokenized Action Head (Language Model Vocabulary)
-
-**Structure**: Uses the **last 256 tokens** of the LLaMA vocabulary (tokens 31744-31999)
+The OpenVLA model uses the **last 256 tokens** of the LLaMA vocabulary (tokens 31744-31999) for action prediction.
 
 ```python
-# Extract action token logits
-full_logits = language_model(...).logits              # (batch, seq, 32000)
-action_logits = full_logits[:, -56:, -256:]           # (batch, 56, 256)
+# VLA forward pass
+output = vla.forward(images, text_prompt)
+logits = output.logits  # (batch, seq_len, 32000) - full vocab
+
+# Extract action token logits (last 256 tokens)
+action_logits = logits[:, action_positions, -256:]  # (batch, 56, 256)
 # 56 positions = 8 actions × 7 dimensions per action
 # 256 bins = discretization of continuous range [-1, 1]
 ```
 
+### Two Sampling Modes (Same Head)
+
+The model can sample actions in two ways from the SAME tokenized head:
+
+#### 1. Greedy Mode (Deterministic Teacher)
+
+#### 1. Greedy Mode (Deterministic Teacher)
+
+```python
+# Used during warmup rollouts and validation
+actions = vla.predict_action(
+    **inputs,
+    do_sample=False,  # Argmax from token distribution
+)
+
+# Internally:
+sampled_indices = action_logits.argmax(dim=-1)  # (56,) in [0, 255]
+```
+
 **Properties**:
-- **Trainable**: Updated with LoRA adapters during PPO
-- **Initially Poor**: Starts at ~0% success rate (random)
-- **Stochastic**: Samples from distribution during rollout
-- **Improves with RL**: Target is 80%+ success after training
+- **Frozen pretrained VLA** achieves **~80% success** with this mode
+- **Deterministic**: Always picks highest probability bin
+- **Used as teacher**: Warmup rollouts use this to generate training data
+
+#### 2. Stochastic Mode (Trainable Student)
+
+```python
+# Used during RL rollouts (with temperature exploration)
+probs = torch.softmax(action_logits / temperature, dim=-1)
+sampled_indices = torch.multinomial(probs, num_samples=1)  # Sample from distribution
+```
+
+**Properties**:
+- **Trainable LoRA adapters** improve this mode during PPO
+- **Stochastic**: Samples from probability distribution
+- **Starts poor** (~0% success), **improves to 80%+** with training
+- **Temperature controls exploration**: 1.0 = standard softmax, 1.6 = high exploration
 
 ### Action Tokenization: Continuous ↔ Discrete Mapping
 
@@ -964,74 +983,63 @@ def predict_action_tokens_with_grad(obs, task_prompt, temperature=1.6):
 - **256 bins** = discretization granularity for each dimension
 - **Action logits shape**: `(batch=1, sequence=56, vocab=256)`
 
-### Action Generation in Phase 1: BC Warmup
+### Action Generation in Phase 1: Self-Distillation Warmup
 
-**Rollout Collection** (execute L1 actions):
+**Rollout Collection** (greedy tokenized actions):
 
 ```python
-def _get_action_l1_with_logprobs(obs, task_prompt):
-    """Execute L1 actions while computing tokenized log probs for PPO."""
-    
-    # === Get high-quality L1 actions (frozen head) ===
-    self.actor.vla.eval()
-    self.actor.l1_action_head.eval()
+def _get_action_via_predict(obs, task_prompt):
+    """Execute greedy tokenized actions (teacher policy)."""
     
     with torch.no_grad():
-        # Use VLA's built-in predict_action with L1 head
-        l1_actions = vla_model.predict_action(
+        # Use VLA's predict_action with do_sample=False (greedy)
+        actions = vla_model.predict_action(
             **inputs,
-            action_head=self.actor.l1_action_head,  # Use L1, not tokens
-            do_sample=False,  # Deterministic
+            do_sample=False,  # Argmax - deterministic
         )
-        # Returns: (8, 7) continuous actions in [-1, 1]
+        # Returns: (8, 7) continuous actions from GREEDY tokenized prediction
+        # This achieves ~80% success (frozen pretrained)
     
-    # === Compute log probs from tokenized head (for PPO gradients) ===
-    # Get token logits with gradients enabled
-    action_data = predict_action_tokens_with_grad(obs, task_prompt)
-    
-    # Discretize L1 actions to target tokens
-    l1_flat = l1_actions.flatten()  # (56,)
-    target_token_ids = action_tokenizer.discretize_actions(l1_flat)  # (56,)
-    target_indices = target_token_ids - (vocab_size - 256)  # [0, 255]
-    
-    # Compute log probability of L1 actions under current token distribution
-    log_probs_per_token = logprobs_from_logits(
-        action_data['logits'],  # (1, 56, 256)
-        torch.from_numpy(target_indices)  # (56,)
-    )
-    log_prob = log_probs_per_token.mean()  # Mean over 56 tokens
-    
-    return l1_actions, {'log_prob': log_prob, 'l1_action': l1_actions, ...}
+    return actions
 ```
+
+**What "greedy tokenized" means:**
+1. Forward pass → action logits `(56, 256)`
+2. **Argmax** to get bin indices (deterministic)
+3. Lookup bin centers → continuous actions
+4. **NO separate regression head involved**
 
 **Training Update** (cross-entropy loss):
 
 ```python
 def _bc_update_from_l1(task_prompt):
-    """Train tokenized head to match L1 actions (behavior cloning)."""
+    """Train stochastic policy to match greedy policy (self-distillation)."""
     
-    # Get stored L1 actions from buffer (ground truth)
-    l1_actions = buffer['l1_actions']  # (batch, 8, 7)
+    # Get greedy actions from buffer (teacher targets)
+    greedy_actions = buffer['l1_actions']  # (batch, 8, 7) - misnomer, actually greedy tokenized
     
-    for obs, l1_action_chunk in zip(observations, l1_actions):
-        # 1. Convert L1 actions to target token IDs
-        l1_flat = l1_action_chunk.flatten()  # (56,)
-        target_tokens = action_tokenizer.discretize_actions(l1_flat)
+    for obs, greedy_chunk in zip(observations, greedy_actions):
+        # 1. Convert greedy actions to target token IDs
+        greedy_flat = greedy_chunk.flatten()  # (56,)
+        target_tokens = action_tokenizer.discretize_actions(greedy_flat)
         target_indices = target_tokens - (vocab_size - 256)  # [0, 255]
         
-        # 2. Get tokenized head predictions (with gradients)
-        action_data = predict_action_tokens_with_grad(obs, task_prompt, sample=False)
+        # 2. Get stochastic policy predictions (with gradients, trainable)
+        action_data = predict_action_tokens_with_grad(
+            obs, task_prompt,
+            temperature=1.0,  # Stochastic sampling
+            sample=True       # Sample, don't argmax
+        )
         logits = action_data['logits'][0]  # (56, 256)
         
-        # 3. Compute cross-entropy loss
-        # Teaches tokenized head to predict same bins as L1
+        # 3. Cross-entropy loss: Teach stochastic to predict greedy's bins
         bc_loss = F.cross_entropy(
-            logits,           # (56, 256) predicted distributions
-            target_indices,   # (56,) target bins
+            logits,           # (56, 256) stochastic predictions
+            target_indices,   # (56,) greedy targets
             reduction='mean'
         )
         
-        # 4. Backward pass
+        # 4. Train stochastic policy
         bc_loss.backward()
     
     optimizer.step()
@@ -1039,7 +1047,7 @@ def _bc_update_from_l1(task_prompt):
 
 **BC Accuracy Metric**:
 ```python
-# Percentage of action bins correctly predicted
+# Percentage of bins where stochastic matches greedy
 predicted_bins = logits.argmax(dim=-1)  # (56,)
 accuracy = (predicted_bins == target_indices).float().mean()
 # Current: 14% → Target: 30%+ by step 25k
@@ -1051,118 +1059,73 @@ accuracy = (predicted_bins == target_indices).float().mean()
 
 ```python
 def collect_rollouts(env, task_prompt):
-    """Collect experience with mixed L1/tokenized actions."""
+    """Collect experience with mixed greedy/stochastic actions."""
     
     for step in range(n_steps):
-        # Decide which policy to use
-        if _should_use_l1_actions():
+        # Decide which mode to use
+        if _should_use_l1_actions():  # Misnomer - actually "use greedy mode"
             # Decreasing probability (100% → 0% over transition)
-            actions, info = _get_action_l1_with_logprobs(obs, task_prompt)
+            actions = _get_action_via_predict(obs, task_prompt)  # Greedy
         else:
             # Increasing probability (0% → 100% over transition)
-            actions, info = _get_action_via_tokens(obs, task_prompt)
+            actions = _get_action_via_tokens(obs, task_prompt)  # Stochastic
         
         # Execute in environment
         next_obs, reward, done, _ = env.step(actions)
-        buffer.add(obs, actions, info['log_prob'], ...)
+        buffer.add(obs, actions, ...)
 ```
 
 **Epsilon Decay Schedule**:
 ```python
-# At step 25,000 (start transition): ε = 1.0 → 100% L1 actions
-# At step 27,500 (mid transition):   ε = 0.5 → 50% L1, 50% tokenized
-# At step 30,000 (end transition):   ε = 0.0 → 100% tokenized actions
+# At step 25,000 (start transition): ε = 1.0 → 100% greedy
+# At step 30,000 (mid transition):   ε = 0.5 → 50% greedy, 50% stochastic
+# At step 35,000 (end transition):   ε = 0.0 → 0% greedy, 100% stochastic
 ```
 
-**Training**: Switches from cross-entropy to **PPO loss** (uses advantages, not L1 targets)
+**Training**: Switches from cross-entropy to **PPO loss**
 
 ### Action Generation in Phase 3: Pure RL
 
-**Rollout Collection** (tokenized actions only):
+**Rollout Collection** (stochastic tokenized only):
 
 ```python
-def _get_action_via_tokens(obs, task_prompt, temperature=1.6):
-    """Generate actions from tokenized head with stochastic sampling."""
+def _get_action_via_tokens(obs, task_prompt, temperature=1.0):
+    """Generate actions from stochastic sampling (trained policy)."""
     
-    # === 1. Get action token logits with gradients ===
+    # Get action token logits with gradients
     action_data = predict_action_tokens_with_grad(
         obs, task_prompt,
-        temperature=temperature,  # 1.6 for exploration
+        temperature=temperature,  # 1.0 for exploration
         sample=True               # Stochastic sampling
     )
     
     action_token_logits = action_data['logits']  # (1, 56, 256)
     
-    # === 2. Apply temperature and sample ===
+    # Apply temperature and sample
     scaled_logits = action_token_logits / temperature
     probs = torch.softmax(scaled_logits, dim=-1)  # (1, 56, 256)
     
     # Sample 56 token indices from [0, 255]
-    probs_flat = probs.reshape(-1, 256)           # (56, 256)
-    sampled_indices = torch.multinomial(probs_flat, num_samples=1)  # (56, 1)
-    sampled_indices = sampled_indices.squeeze(-1)  # (56,)
+    sampled_indices = torch.multinomial(probs.view(-1, 256), num_samples=1).squeeze()
     
-    # === 3. Convert to vocabulary token IDs ===
-    token_ids = sampled_indices + (vocab_size - 256)  # [31744, 31999]
-    
-    # === 4. Compute log probabilities (for PPO) ===
-    log_probs_per_token = logprobs_from_logits(
-        action_token_logits,  # (1, 56, 256)
-        sampled_indices       # (56,)
-    )
+    # Compute log probabilities (for PPO)
+    log_probs_per_token = torch.log(probs.gather(-1, sampled_indices.unsqueeze(-1)))
     log_prob = log_probs_per_token.mean()  # Mean over 56 tokens
     
-    # === 5. Detokenize to continuous actions ===
-    token_ids_np = token_ids.detach().cpu().numpy()
-    bin_indices = vocab_size - token_ids_np           # [1, 256]
-    bin_indices = np.clip(bin_indices - 1, 0, 254)    # [0, 254]
-    continuous_actions = bin_centers[bin_indices]     # (56,) in [-1, 1]
-    actions_chunk = continuous_actions.reshape(8, 7)  # (8, 7)
+    # Detokenize to continuous actions
+    token_ids = sampled_indices + (vocab_size - 256)  # [31744, 31999]
+    bin_indices = vocab_size - token_ids.cpu().numpy()
+    bin_indices = np.clip(bin_indices - 1, 0, 254)
+    continuous_actions = bin_centers[bin_indices].reshape(8, 7)
     
-    # === 6. Execute in environment ===
-    next_obs, reward, done, _ = env.step(actions_chunk)
-    
-    return actions_chunk, {
-        'log_prob': log_prob,
-        'responses': token_ids,
-        'continuous_actions': actions_chunk,
-        ...
-    }
+    return continuous_actions, {'log_prob': log_prob, ...}
 ```
 
 **Training** (PPO loss):
 
 ```python
-def update_policy():
-    """Update tokenized head with PPO loss."""
-    
-    # Get old actions from buffer
-    old_log_probs = buffer['log_probs']
-    old_token_ids = buffer['responses']
-    advantages = buffer['advantages']  # From GRPO
-    
-    for obs, old_tokens, old_log_prob, adv in minibatches:
-        # 1. Recompute log probs with current policy
-        action_data = predict_action_tokens_with_grad(obs, task_prompt)
-        
-        # Extract log prob of stored actions
-        new_log_probs = logprobs_from_logits(
-            action_data['logits'],
-            old_tokens  # Same actions, new probabilities
-        ).mean()
-        
-        # 2. Compute PPO ratio
-        log_ratio = new_log_prob - old_log_prob
-        ratio = torch.exp(log_ratio)
-        
-        # 3. Clipped surrogate loss
-        clipped_ratio = torch.clamp(ratio, 1-clip_eps, 1+clip_eps)
-        policy_loss = -torch.min(ratio * adv, clipped_ratio * adv)
-        
-        # 4. Backward pass
-        policy_loss.backward()
-    
-    optimizer.step()
+# Recompute log probs, compute ratio, apply clipped objective
+# Standard PPO update on stochastic policy
 ```
 
 ### Action Chunking: 8 Actions Per Forward Pass
@@ -1193,11 +1156,36 @@ Tokens 28-42:    Text prompt ("What action should...")
 Tokens 43-98:    Action tokens (8 actions × 7 dims = 56 tokens)
 ```
 
-### Summary: Action Generation Comparison
+### Summary: Greedy vs Stochastic Tokenized Actions
 
-| Aspect | L1 Regression Head | Tokenized Action Head |
-|--------|-------------------|----------------------|
-| **Architecture** | Linear layer (768 → 1) | Last 256 vocab tokens |
+| Aspect | Greedy Tokenized (Teacher) | Stochastic Tokenized (Student) |
+|--------|---------------------------|-------------------------------|
+| **Sampling** | Argmax (deterministic) | Multinomial (stochastic) |
+| **Training** | Frozen (pretrained) | LoRA adapters (trainable) |
+| **Quality** | High (80% success) | Low → High (0% → 80%+) |
+| **Temperature** | N/A (argmax) | 1.0 (training), 0.0 (eval) |
+| **Usage** | Phase 1-2 rollouts, validation | Phase 2-3 rollouts, all training |
+| **Loss Function** | N/A (frozen) | Cross-entropy (Phase 1), PPO (Phase 2-3) |
+| **Stochasticity** | Deterministic | Stochastic (temperature sampling) |
+| **Output** | Continuous (8, 7) | Token IDs → Continuous (8, 7) |
+| **Gradients** | Disabled | Enabled (for RL updates) |
+
+**Key Insight**: Both use the SAME tokenized action mechanism (last 256 vocab tokens). The only difference is **sampling strategy**: greedy argmax vs stochastic multinomial.
+
+### Validation: Dual Evaluation System
+
+Both modes evaluated separately to track learning progress:
+
+```python
+# Greedy baseline (frozen, should stay ~80%)
+greedy_success_rate = evaluate_policy(use_builtin_predict=True)  # do_sample=False
+
+# Stochastic policy (improving 0% → 80%+)
+stochastic_success_rate = evaluate_tokenized_policy()  # temperature=0.0 (greedy mode of trained policy)
+
+# Performance gap (should close over training)
+gap = greedy_success_rate - stochastic_success_rate  # Target: <20% by 100k steps
+```
 | **Training** | Frozen (pre-trained) | LoRA adapters (trainable) |
 | **Quality** | High (80% success) | Low → High (0% → 80%+) |
 | **Speed** | Fast (direct) | Moderate (tokenize + detokenize) |
@@ -1257,7 +1245,11 @@ def _get_action_l1_with_logprobs(self, obs, task_prompt, temperature=1.0):
     """
     HYBRID: Generate actions with L1 head, compute log probs from tokenized head.
     
-    This is the key innovation enabling high-quality rollouts + trainable policy.
+    This combines:
+    - High-quality actions from pretrained L1 regression head (frozen)
+    - Log probabilities from tokenized action head (trainable)
+    
+    Returns action chunk + log probabilities for PPO training.
     """
     
     # ============================================================
@@ -1346,7 +1338,7 @@ def _get_action_l1_with_logprobs(self, obs, task_prompt, temperature=1.0):
 - **Training signal**: PPO learns to make tokenized head predict same actions as L1
 
 **Why This Works**:
-1. **L1 actions** ensure good rollout quality (rewards are high)
+1. **L1 actions** ensure good rollout quality (better rewards)
 2. **Token log probs** provide differentiable training signal
 3. **PPO updates** gradually improve tokenized head to match L1 performance
 4. **Eventually** tokenized head learns to generate L1-quality actions independently
@@ -1399,14 +1391,14 @@ def collect_rollouts(self):
                 obs,
                 task_prompt=self.task_prompt,
                 temperature=self.cfg.rollout_temperature,  # 1.0
-                use_builtin_predict=False,  # Use L1 head for actions
+                use_builtin_predict=False,  # Use L1 head + token log probs
             )
         
         action = action_data['continuous_action']
         log_prob = action_data['log_prob'].mean()  # Mean over 256 action tokens
         
         # 2. Environment step
-        next_obs, reward, done, info = self.envs.step(action)
+        next_obs, reward, done, info = env.step(action)
         
         # 3. Store transition
         observations.append(obs)
@@ -1450,6 +1442,7 @@ def _get_action_l1_with_logprobs(self, obs, task_prompt, temperature=1.0):
     
     Returns action chunk + log probabilities for PPO training.
     """
+    
     # 1. Prepare inputs
     images = obs['agentview_rgb']  # (batch, 3, 224, 224)
     proprio = obs['robot_states']  # (batch, 8)
@@ -1888,7 +1881,7 @@ Loss = -J(θ)
 ratio = 1.0 (policy unchanged)
 advantage = +0.14
 policy_loss = -min(1.0 * 0.14, 1.0 * 0.14)
-           = -0.14  # NEGATIVE!
+           = -0.14  # NEGATIVE (good!)
 ```
 
 **Gradient descent** on negative loss → **increases log probability** of good actions ✅
@@ -1937,7 +1930,7 @@ Training 7B models with RL creates **gradient instability**:
 **Problem**: Batched forward passes build huge computation graphs
 
 ```python
-# WRONG: Builds massive graph, causes OOM
+# WRONG: Builds a huge graph, causes OOM
 for idx in batch:
     forward_pass()
     results.append(output)  # Retains graph!
@@ -2015,22 +2008,10 @@ self.actor_optimizer.step()
 log_ratio = new_log_prob - old_log_prob
 
 # Clamp to [-5, 5]
-# e^5 ≈ 148, e^-5 ≈ 0.007
+# e^5 ≈ 148, e^-5 ≈ 0.007 (reasonable range)
 log_ratio = torch.clamp(log_ratio, min=-5.0, max=5.0)
 
 ratio = torch.exp(log_ratio)  # Now in [0.007, 148]
-```
-
-**Why needed**: With log probs of -10, even small changes create large ratios:
-```python
-old_log_prob = -10.5
-new_log_prob = -5.2   # Change of +5.3
-log_ratio = 5.3
-ratio = exp(5.3) = 200!  # Huge ratio!
-
-# After clamping:
-log_ratio_clamped = 5.0
-ratio_clamped = exp(5.0) = 148  # Still large but bounded
 ```
 
 ### Gradient Statistics (from logs)
@@ -2067,7 +2048,7 @@ ratio_clamped = exp(5.0) = 148  # Still large but bounded
 
 ### Update Loop Overview
 
-**Goal**: Optimize policy using collected rollouts over multiple epochs
+**Goal**: Optimize policy using PPO clipped objective.
 
 **File**: `OpenVLA_PPO.py`, `update_policy()` (lines 1100-1400)
 
@@ -2186,7 +2167,7 @@ for mb in minibatches:
 
 **Why**: Prevents computation graph buildup while allowing small-batch efficiency
 
-### Training Progress (from logs)
+### Training Progression (from logs)
 
 ```
 📊 Advantage Statistics:
@@ -2208,291 +2189,439 @@ for mb in minibatches:
 ⚠️ Large gradient: 22.38 (clip at 1.0) - clipped and applied
 ⚠️ Large gradient: 21.07 (clip at 1.0) - clipped and applied
 
-⚠️ CRITICAL: Gradient explosion: 257.29 → skipping
-⚠️ CRITICAL: Gradient explosion: 558.28 → skipping
+⚠️ CRITICAL: Gradient explosion: 257.29 (clip at 1.0)
+  Skipping optimizer step to prevent training collapse.
+
+⚠️ CRITICAL: Gradient explosion: 558.28 (clip at 1.0)
+  Skipping optimizer step to prevent training collapse.
 
 Epoch 1/10 → Policy Loss: -0.178017 | Clip Frac: 0.8984 | KL: -0.560698
 ```
 
 **Success Indicators**:
-- ✅ **Finite losses**: -0.178 (no NaN!)
-- ✅ **High clip fraction**: 0.898 (policy updating)
-- ✅ **Some updates succeed**: 3/256 minibatches (enough for learning)
-- ✅ **Gradients stable**: 20-30 range gets clipped and applied
+- ✅ BC accuracy improves 0% → 30%+ during warmup
+- ✅ Tokenized success reaches 40%+ by step 25k
+- ✅ No collapse during transition (stays above 35%)
+- ✅ Continued improvement in RL phase (50% → 80%+)
+- 🎯 **Stretch Goal**: Tokenized exceeds L1 (>85%)
 
-### Wandb Logging
+**Training Configuration**:
+- **Actions**: L1 (warmup) → mixed (transition) → tokenized (RL)
+- **Loss**: Cross-entropy (warmup) → PPO (transition/RL)
+- **Trainable**: LoRA 55.4M + proprio 16.8M = 72.2M params (0.95%)
+- **Frozen**: VLA backbone 7.5B + L1 head 167M = 7.7B params
+- **Multi-GPU**: DataParallel on 2 GPUs (optional, 2x speedup)
 
-```python
-if self.cfg.use_wandb:
-    wandb.log({
-        "train/policy_loss": policy_loss,
-        "train/clip_frac": clip_frac,
-        "train/approx_kl": approx_kl,
-        "train/grad_norm": total_norm,
-        "train/skip_rate": skip_rate,
-    })
-```
-
-**Metrics Tracked**:
-- `policy_loss`: Should decrease (more negative)
-- `clip_frac`: 0.7-0.9 indicates significant policy changes
-- `approx_kl`: KL divergence between old and new policy
-- `grad_norm`: Average gradient magnitude
-- `skip_rate`: Percentage of updates skipped due to explosions
+**Expected Training Timeline** (2x NVIDIA 4090):
+- Warmup completion: ~12-15 hours (25k steps)
+- Transition completion: ~3 hours (5k steps)
+- Full training: ~48 hours (100k steps)
 
 ---
 
-## Dual Validation System
+# PPO Implementation Guide
 
-### Why Two Validation Modes?
+**Complete reference for Group Relative Policy Optimization (GRPO) with LoRA fine-tuning of OpenVLA-7B**
 
-During hybrid training (L1 rollouts + tokenized training), we need to track **two separate metrics**:
-
-1. **L1 Head Validation**: Baseline performance (frozen, ~80-85% success)
-2. **Tokenized Head Validation**: Learning progress (trainable, 0% → 80%+)
-
-**Goal**: Close the gap between tokenized and L1 performance over training.
-
-### Validation Implementation
-
-**File**: `OpenVLA_PPO.py`, lines 1820-2080
-
-#### 1. L1 Head Validation (Baseline)
-
-```python
-def validate(self, env, task_prompt: str) -> Dict[str, float]:
-    """Validate using L1 head (pretrained baseline)."""
-    self.actor.vla.eval()
-    
-    val_rewards = []
-    val_successes = []
-    
-    with torch.inference_mode():  # Deterministic evaluation
-        for episode in range(num_eval_episodes):
-            obs = env.reset()
-            done = False
-            
-            while not done:
-                # Use built-in predict_action (L1 head, greedy)
-                actions_chunk, _ = self.get_action(
-                    obs, task_prompt,
-                    temperature=0.0,        # Greedy
-                    use_builtin_predict=True  # L1 head
-                )
-                
-                # Execute actions sequentially
-                for action in actions_chunk:
-                    obs, reward, done, info = env.step(action)
-                    if done:
-                        break
-            
-            success = info.get('success', 0)
-            val_successes.append(success)
-    
-    return {
-        'val/l1_success_rate': np.mean(val_successes),
-        'val/l1_mean_reward': np.mean(val_rewards),
-    }
-```
-
-#### 2. Tokenized Head Validation (Learning Progress)
-
-```python
-def validate_tokenized(self, env, task_prompt: str) -> Dict[str, float]:
-    """Validate using ONLY tokenized action head (trainable)."""
-    self.actor.vla.eval()
-    
-    val_rewards = []
-    val_successes = []
-    
-    with torch.inference_mode():
-        for episode in range(num_eval_episodes):
-            obs = env.reset()
-            done = False
-            
-            while not done:
-                # Use tokenized head with greedy sampling
-                action_data = self.predict_action_tokens_with_grad(
-                    obs, task_prompt,
-                    temperature=0.0,  # Greedy
-                    sample=False      # Argmax
-                )
-                
-                actions_chunk = action_data['continuous_actions']  # (8, 7)
-                
-                # Execute actions sequentially
-                for action in actions_chunk:
-                    obs, reward, done, info = env.step(action)
-                    if done:
-                        break
-            
-            success = info.get('success', 0)
-            val_successes.append(success)
-    
-    return {
-        'val/tokenized_success_rate': np.mean(val_successes),
-        'val/tokenized_mean_reward': np.mean(val_rewards),
-    }
-```
-
-#### 3. Combined Validation with Gap Tracking
-
-```python
-# In validate() method
-l1_metrics = {
-    'val/l1_mean_reward': ...,
-    'val/l1_success_rate': ...,
-}
-
-tokenized_metrics = self.validate_tokenized(env, task_prompt)
-
-# Calculate performance gap
-gap = l1_metrics['val/l1_success_rate'] - tokenized_metrics['val/tokenized_success_rate']
-
-# Log comparison
-print(f"[Validation] L1 Head: {l1_metrics['val/l1_success_rate']*100:.1f}% success")
-print(f"[Validation] Tokenized Head: {tokenized_metrics['val/tokenized_success_rate']*100:.1f}% success")
-print(f"[Validation] Gap: {gap*100:.1f}% (tokenized needs to close this)")
-
-return {**l1_metrics, **tokenized_metrics, 'val/gap': gap}
-```
-
-### Expected Training Progression
-
-| Step | L1 Success | Tokenized Success | Gap | Notes |
-|------|-----------|-------------------|-----|-------|
-| **0** | 80% | 0% | 80% | Tokenized untrained |
-| **12,000** | 85% | 15% | 70% | BC warmup working |
-| **25,000** | 90% | 40% | 50% | End of warmup |
-| **30,000** | 90% | 50% | 40% | After transition |
-| **50,000** | 92% | 65% | 27% | RL phase learning |
-| **100,000** | 93% | 80% | 13% | Target: <20% gap |
-
-### Wandb Metrics
-
-All validation metrics logged to wandb:
-
-| Metric | Description | Target |
-|--------|-------------|--------|
-| `val/l1_success_rate` | L1 head performance | ~80-85% (frozen) |
-| `val/tokenized_success_rate` | Tokenized learning | 0% → 80%+ |
-| `val/gap` | L1 - tokenized | 80% → <20% |
-| `val/l1_mean_reward` | L1 rewards | ~0.8 |
-| `val/tokenized_mean_reward` | Tokenized rewards | 0.0 → 0.8+ |
-
-### Monitoring Strategy
-
-#### Every Validation Interval (1024 steps):
-
-**Check Progress**:
-```python
-if tokenized_success_rate > 0.05:  # Learning started
-    print("✓ Tokenized head learning from L1 demonstrations")
-else:
-    print("⚠️ Tokenized stuck at 0%, check BC loss/accuracy")
-
-if gap < 0.3:  # Within 30%
-    print("✓ Approaching L1 performance, consider extending RL phase")
-```
-
-**Early Warning Signs**:
-- Tokenized stuck at <5% after 25k steps → BC not working
-- Gap not closing after 50k steps → May need more warmup
-- Gap increasing during RL phase → Catastrophic forgetting
-
-**Success Indicators**:
-- Steady upward trend in tokenized success
-- Gap closing to <30% by 50k steps
-- Gap <20% by 100k steps
-- Eventually: tokenized matches or exceeds L1!
-
-### Critical Bug Fix: Token Range Extraction
-
-**Issue**: Validation was failing (0% success) due to wrong token range extraction.
-
-**Before** (incorrect):
-```python
-action_token_logits = action_logits[..., -256-64:-64]  # WRONG
-# Extracted tokens 31680-31936 (wrong range!)
-```
-
-**After** (correct):
-```python
-action_token_logits = action_logits[..., -256:]  # CORRECT
-# Extracts tokens 31744-32000 (last 256 tokens = action vocabulary)
-```
-
-**Impact**: This bug caused 0% validation success because the model was predicting from wrong token range. After fix, tokenized head can properly learn from demonstrations.
+**Last Updated**: December 8, 2025  
+**Status**: Training Working ✅ | BC Warmup Implemented ✅ | Multi-GPU Ready ✅
 
 ---
 
-## Configuration Reference
+## Table of Contents
 
-### PPOConfig
-
-**File**: `ppo/config.py`
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| **Training** |||
-| `total_timesteps` | 10000000 | Total environment steps |
-| `n_steps` | 512 | Rollout length per update |
-| `batch_size` | 2 | Samples per minibatch |
-| `n_epochs` | 10 | Epochs over collected data |
-| **Optimization** |||
-| `actor_lr` | 1e-6 | Learning rate (conservative for 7B) |
-| `max_grad_norm` | 1.0 | Gradient clipping threshold |
-| `clip_ratio_high` | 0.28 | Upper clip bound (positive advantages) |
-| `clip_ratio_low` | 0.2 | Lower clip bound (negative advantages) |
-| **GRPO** |||
-| `verifier_gamma` | 1.0 | Discount factor (1.0 = no discounting) |
-| **Phased Training** |||
-| `use_l1_warmstart` | True | Enable BC warmup → transition → RL |
-| `l1_warmup_steps` | 25000 | BC warmup duration (0-25k steps) |
-| `l1_transition_steps` | 5000 | Epsilon-greedy transition (25k-30k) |
-| **Sampling** |||
-| `rollout_temperature` | 1.0 | Exploration temperature |
-| `eval_temperature` | 0.0 | Greedy evaluation |
-| **Logging** |||
-| `use_wandb` | True | Enable Weights & Biases |
-| `log_interval` | 512 | Log every N steps |
-| `val_interval` | 2560 | Validate every N steps |
-
-### OpenVLAActorConfig
-
-**File**: `vla-oft/min_vla/config.py`
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| **Model** |||
-| `pretrained_checkpoint` | "vla_oft/openvla-7b-oft-finetuned-libero-spatial" | Model path |
-| `use_local` | True | Load from local path |
-| **LoRA** |||
-| `use_lora` | True | Enable LoRA adapters |
-| `lora_rank` | 16 | LoRA rank (adapter size) |
-| `lora_alpha` | 16 | Scaling factor |
-| `lora_dropout` | 0.0 | Dropout (disabled) |
-| `freeze_vla_backbone` | True | Freeze base, train LoRA only |
-| **Actions** |||
-| `use_tokenized_actions` | True | Use token logits (required) |
-| `load_l1_action_head` | True | Load L1 head for hybrid training (adds 668MB) |
-| `freeze_l1_action_head` | True | Keep L1 head frozen (not trained during PPO) |
-| **Hardware** |||
-| `gpu_id` | 1 | Primary GPU |
-| `use_data_parallel` | False | Enable DataParallel (2 GPUs) |
-| `use_flash_attention` | True | Enable Flash Attention 2 |
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+3. [VLA Actor Setup](#vla-actor-setup)
+4. [LoRA Adapter Configuration](#lora-adapter-configuration)
+5. [Training Phases: BC Warmup → RL](#training-phases-bc-warmup--rl)
+6. [Action Generation: From Model to Robot Commands](#action-generation-from-model-to-robot-commands)
+7. [Rollout Collection](#rollout-collection)
+8. [GRPO Advantage Computation](#grpo-advantage-computation)
+9. [Policy Loss Calculation](#policy-loss-calculation)
+10. [Gradient Protection & Clipping](#gradient-protection--clipping)
+11. [Policy Updates](#policy-updates)
+12. [Dual Validation System](#dual-validation-system)
+13. [Configuration Reference](#configuration-reference)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
-## Troubleshooting
+## Overview
 
-### Training Issues
+This guide documents our implementation of **Group Relative Policy Optimization (GRPO)** for fine-tuning OpenVLA-7B on robotic manipulation tasks using the LIBERO benchmark. Our approach combines:
 
-#### 1. NaN Losses
+- **OpenVLA-7B**: Pre-trained vision-language-action model (7.6B parameters)
+- **LoRA Adapters**: Low-rank adaptation for efficient fine-tuning (~55M trainable params)
+- **GRPO**: Value-free advantage estimation using group relative outcomes
+- **Action Tokenization**: 256-bin discretization of continuous actions via last 256 vocab tokens
+- **Self-Distillation Warmup**: Train stochastic policy to match greedy policy (cross-entropy loss)
+- **Phased Training**: Greedy warmstart → epsilon-greedy transition → stochastic RL
+- **Sparse Rewards**: Binary success/failure at episode completion
+- **Action Chunking**: 8 actions per forward pass (temporal consistency)
+- **Multi-GPU Support**: DataParallel for 2x speedup on dual GPUs
 
-**Symptoms**:
+### Key Features ✅
+
+- **Working Training Loop**: Successfully trains with finite losses and updating metrics
+- **LoRA Integration**: Base 7B backbone frozen, 55.4M LoRA adapters trainable (0.73%)
+- **Self-Distillation Warmup**: Stochastic learns from greedy (0-25k steps, cross-entropy loss)
+- **Phased Transition**: Greedy warmstart → epsilon-greedy → pure stochastic RL
+- **Action Chunking**: One forward pass = 8 actions (efficiency + temporal consistency)
+- **Dual Validation**: Track both greedy baseline and stochastic policy separately
+- **Gradient Stability**: Clipping and skip thresholds prevent catastrophic explosions
+- **Memory Efficient**: ~18-19GB on single GPU, ~18-20GB per GPU with DataParallel
+- **Multi-GPU Support**: DataParallel for 1.8-2.3x speedup on 2 GPUs
+- **Wandb Integration**: Real-time logging of training metrics
+
+---
+
+## Architecture
+
+### Training Pipeline Overview
+
 ```
-Epoch 1/10 → Policy Loss: nan | Clip Frac: nan | KL: nan
+┌─────────────────────────────────────────────────────────────┐
+│                    1. VLA Actor Setup                       │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ • Load OpenVLA-7B checkpoint (7.6B params)           │   │
+│  │ • Apply LoRA adapters (55.4M trainable params)       │   │
+│  │ • Freeze base backbone (7.5B params)                 │   │
+│  │ • Initialize action tokenizer (256 bins)             │   │
+│  │ • Setup proprio projector (16.8M params)             │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│                  2. Rollout Collection                      │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ • Stochastic action sampling (temp=1.0)              │   │
+│  │ • Store: obs, actions, log_probs                     │   │
+│  │ • Collect 512 steps (6-7 trajectories)               │   │
+│  │ • Sparse rewards: 1.0 at success, 0.0 otherwise      │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│               3. GRPO Advantage Computation                 │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ • Group trajectories by success/failure              │   │
+│  │ • Compute: advantage = reward - group_mean           │   │
+│  │ • Normalize advantages: (A - μ) / σ                  │   │
+│  │ • Result: A ∈ [-10, 10], mean=0.98 for successes     │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│                  4. Policy Loss Calculation                 │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ • Forward pass VLA to get new log_probs              │   │
+│  │ • Compute log ratio: log(π_new/π_old)                │   │
+│  │ • Clamp log ratio: [-5, 5]                           │   │
+│  │ • PPO clipped loss with asymmetric clipping          │   │
+│  │ • Result: policy_loss = -0.18 (NEGATIVE to maximize) │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│            5. Gradient Protection & Clipping                │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ • Per-sample backward() (prevents graph buildup)     │   │
+│  │ • Gradient clipping: max_norm=1.0                    │   │
+│  │ • Skip threshold: gradient > 1000 → skip update      │   │
+│  │ • Result: gradients 20-600 clipped and applied       │   │ 
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│                     6. Policy Updates                       │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ • 10 epochs over collected data                      │   │ 
+│  │ • 256 minibatches per epoch (batch_size=2)           │   │
+│  │ • AdamW optimizer step after gradient accumulation   │   │
+│  │ • Log metrics: loss, clip_frac, KL divergence        │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Hybrid L1 + Tokenized Action Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     VLA Forward Pass                            │
+│                                                                 │
+│  Image + Proprio + Task Prompt                                 │
+│         ↓                                                       │
+│  ┌─────────────────────────────────────────┐                   │
+│  │  Vision Encoder + Language Model        │                   │
+│  │  (7.6B params with LoRA adapters)       │                   │
+│  └─────────────────────────────────────────┘                   │
+│         ↓                          ↓                            │
+│  ┌──────────────┐          ┌──────────────┐                    │
+│  │  L1 Head     │          │  Token Logits│                    │
+│  │  (frozen)    │          │  (trainable) │                    │
+│  └──────────────┘          └──────────────┘                    │
+│         ↓                          ↓                            │
+│  Actions (56 dims)         Logits (56 × 256)                   │
+│  [-1, 1] continuous        One per action bin                  │
+└─────────────────────────────────────────────────────────────────┘
+         ↓                          ↓
+         ↓                   ┌──────────────┐
+         ↓                   │  Discretize  │
+         ↓                   │  L1 Actions  │
+         ↓                   └──────────────┘
+         ↓                          ↓
+         ↓                   Token IDs (56 dims)
+         ↓                   [31744, 32000)
+         ↓                          ↓
+         ↓                   ┌──────────────────┐
+         ↓                   │ logprobs_from_   │
+         ↓                   │ logits()         │
+         ↓                   │                  │
+         ↓                   │ log_softmax +    │
+         ↓                   │ gather()         │
+         ↓                   └──────────────────┘
+         ↓                          ↓
+         ↓                   Log Probs (56 dims)
+         ↓                   One per action dim
+         ↓                          ↓
+         ↓                   mean() → scalar
+         ↓                          ↓
+         ↓                   ┌──────────────────┐
+         ├──────────────────→│  Store Together  │
+                             │                  │
+                             │ • Actions (L1)   │
+                             │ • Log Probs (tok)│
+                             └──────────────────┘
+                                     ↓
+                             ┌──────────────────┐
+                             │  Environment     │
+                             │  Step            │
+                             │                  │
+                             │  Execute: L1     │
+                             │  Train:   Tokens │
+                             └──────────────────┘
+```
+
+**Key Insight**: Two parallel pathways from same forward pass!
+- **Left path** (L1): Generates actions to execute (frozen, high quality)
+- **Right path** (Tokens): Computes log probs for training (trainable)
+
+### Action Tokenization Architecture
+
+```
+Continuous Action Space [-1, 1]^7
+         ↓
+   [256-bin discretization]
+         ↓
+Token IDs [31744, 32000)  ← Last 256 tokens of 32K vocabulary
+         ↓
+   [VLA Language Model]
+         ↓
+Action Token Logits (256-dim)
+         ↓
+  [Softmax + Sample]
+         ↓
+Log Probabilities (for policy gradient)
+```
+
+**Key Points**:
+- Actions mapped to vocabulary tokens (not separate MLP)
+- Natural probability distribution via softmax
+- Stochastic sampling with temperature control
+- Log probabilities directly from logits
+
+### Memory Layout (Single GPU, 24GB)
+
+```
+VLA Base Model (7.6B params, frozen):           ~15.0 GB
+LoRA Adapters (55.4M params, trainable):         ~0.4 GB
+Proprio Projector (16.8M params, trainable):     ~0.1 GB
+L1 Action Head (167M params, frozen):            ~0.7 GB
+Rollout Buffer (512 steps):                      ~1.5 GB
+Gradients + Optimizer States:                    ~2.0 GB
+Activations (batch_size=2):                      ~1.0 GB
+─────────────────────────────────────────────────────────
+Total:                                          ~20.7 GB ✅
+```
+
+**Multi-GPU (DataParallel, 2x 24GB)**:
+```
+GPU 0 (Primary):
+  - VLA model replica:           ~15.0 GB
+  - LoRA adapters:                ~0.4 GB
+  - Forward activations:          ~2-4 GB
+  - Optimizer state:              ~3-5 GB
+  Total:                          ~18-22 GB
+
+GPU 1 (Replica):
+  - VLA model replica:           ~15.0 GB
+  - LoRA adapters:                ~0.4 GB
+  - Forward activations:          ~2-4 GB
+  Total:                          ~16-18 GB
+
+Both GPUs: 80-85% utilization, 1.8-2.3x speedup
+```
+
+---
+
+## VLA Actor Setup
+
+### 1. Loading Pre-trained Checkpoint
+
+**File**: `OpenVLA_PPO.py`, lines 100-150
+
+```python
+# Configuration
+vla_config = OpenVLAActorConfig(
+    pretrained_checkpoint="vla_oft/openvla-7b-oft-finetuned-libero-spatial",
+    use_local=True,
+    gpu_id=1,  # Primary GPU
+    use_proprio=True,
+    use_tokenized_actions=True,  # Required for GRPO
+    load_l1_action_head=True,    # Load for hybrid training (see below)
+    freeze_l1_action_head=True,  # Frozen - used only for action generation
+    use_data_parallel=False,     # Enable for multi-GPU training (2 GPUs)
+)
+
+# Initialize actor
+self.actor = OpenVLAActor(vla_config)
+```
+
+**What Gets Loaded**:
+1. **Vision Backbone**: SigLIP vision encoder (~400M params)
+2. **Language Model**: LLaMA 7B (~7B params)  
+3. **Proprio Projector**: MLP for robot state (16.8M params, 8→4096 dim)
+4. **Action Tokenizer**: 256-bin discretization for continuous actions
+5. **Dataset Statistics**: Normalization stats from training data
+
+**Memory After Loading**: ~15GB (bfloat16 precision)
+
+### 2. Applying LoRA Adapters
+
+**File**: `OpenVLA_PPO.py`, lines 126-161
+
+```python
+if vla_config.use_lora:
+    from peft import LoraConfig, get_peft_model
+    
+    # Configure LoRA
+    lora_config = LoraConfig(
+        r=16,                      # Rank (controls adapter size)
+        lora_alpha=16,             # Scaling factor
+        lora_dropout=0.0,          # No dropout for stability
+        target_modules="all-linear",  # Apply to all linear layers
+        init_lora_weights="gaussian",
+    )
+    
+    # Apply LoRA to VLA model (MUST be done BEFORE DataParallel)
+    self.actor.vla = get_peft_model(self.actor.vla, lora_config)
+    
+    # Print trainable parameters
+    self.actor.vla.print_trainable_parameters()
+    # Output: trainable params: 55,414,144 || all params: 7,596,651,328 || trainable%: 0.7295
+
+### 2.5. DataParallel Multi-GPU Wrapping (Optional)
+
+**File**: `OpenVLA_PPO.py`, lines 167-183
+
+```python
+if vla_config.use_data_parallel and torch.cuda.device_count() > 1:
+    print("🚀 Enabling DataParallel on 2 GPUs")
+    
+    # Wrap model with DataParallel (AFTER LoRA application)
+    self.actor.vla = nn.DataParallel(
+        self.actor.vla,
+        device_ids=[0, 1],           # Use GPU 0 and GPU 1
+        output_device=self.device.index  # Gather on primary GPU
+    )
+    
+    print(f"✓ Model replicated across GPUs: [0, 1]")
+    print(f"✓ Batch will be split across GPUs automatically")
+    print(f"✓ Output gathered on: {self.device}")
+```
+
+**CRITICAL ORDER**:
+1. Load VLA model
+2. Apply LoRA adapters (PEFT requires unwrapped model)
+3. Wrap with DataParallel
+4. Apply freezing strategies
+
+**DataParallel Behavior**:
+- Replicates model on both GPUs (~18-20GB per GPU)
+- Automatically splits batch across GPUs during forward pass
+- Synchronizes gradients on primary GPU
+- **Only forwards `forward()` method** - custom methods like `predict_action()` require unwrapping:
+  ```python
+  # Unwrap when calling custom methods
+  vla_model = self.actor.vla.module if isinstance(self.actor.vla, nn.DataParallel) else self.actor.vla
+  actions, _ = vla_model.predict_action(...)  # Works!
+  ```
+
+**Performance**:
+- **Speedup**: 1.8-2.3x with 2 GPUs (100k steps: 28 hrs → 12 hrs)
+- **Memory**: ~18-20GB per GPU (vs ~18GB single GPU)
+- **Utilization**: Both GPUs at 80-85% during training
+```
+**LoRA Architecture**:
+```
+Linear Layer (original):
+  W ∈ R^(d_out × d_in)
+  
+LoRA Decomposition:
+  ΔW = B @ A
+  where:
+    A ∈ R^(r × d_in)   (lora_A)
+    B ∈ R^(d_out × r)  (lora_B)
+    r = 16 (rank)
+  
+Forward Pass:
+  y = Wx + α/r · (BAx)
+  where α = 16 (lora_alpha)
+```
+
+**LoRA Adapters Created**:
+- **Vision Backbone**: 200+ adapters (~15M params)
+  - `patch_embed.proj.lora_A/B`
+  - `blocks.*.attn.qkv.lora_A/B`
+  - `blocks.*.attn.proj.lora_A/B`
+  - `blocks.*.mlp.fc*.lora_A/B`
+
+- **Language Model**: 600+ adapters (~40M params)
+  - `layers.*.self_attn.q_proj.lora_A/B`
+  - `layers.*.self_attn.k_proj.lora_A/B`
+  - `layers.*.self_attn.v_proj.lora_A/B`
+  - `layers.*.self_attn.o_proj.lora_A/B`
+  - `layers.*.mlp.gate_proj.lora_A/B`
+  - `layers.*.mlp.up_proj.lora_A/B`
+  - `layers.*.mlp.down_proj.lora_A/B`
+
+**Total**: 878 LoRA adapter pairs = 55.4M trainable parameters
+
+### 3. Freezing Base Backbone
+
+**File**: `OpenVLA_PPO.py`, lines 215-240
+
+```python
+if vla_config.freeze_vla_backbone and vla_config.use_lora:
+    print("🔒 Freezing Base VLA Backbone (LoRA adapters trainable)")
+    
+    # Freeze vision backbone (except LoRA)
+    for name, param in self.actor.vla.vision_backbone.named_parameters():
+        if 'lora' not in name.lower():
+            param.requires_grad = False
+    
+    # Freeze language model (except LoRA)
+    for name, param in self.actor.vla.language_model.named_parameters():
+        if 'lora' not in name.lower():
+            param.requires_grad = False
+    
+    # Verify freezing
+    trainable = sum(p.numel() for p in self.actor.vla.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in self.actor.vla.parameters())
+    print(f"✓ Frozen base backbone (7B parameters)")
+    print(f"✓ LoRA adapters trainable: {trainable:,} parameters")
+    print(f"✓ Trainable: {100*trainable/total:.2f}%")
 ```
 
 **Causes**:
@@ -2586,32 +2715,37 @@ if vla_config.freeze_vla_backbone and vla_config.use_lora:
 - Increase `batch_size` if memory allows: 2 → 4
 - Profile with: `torch.profiler`
 
-### Verification Checklist
+### Verification Output
 
-✅ **LoRA Applied**:
 ```
+======================================================================
+Applying LoRA Adapters to VLA Model
+======================================================================
 trainable params: 55,414,144 || all params: 7,596,651,328 || trainable%: 0.7295
-```
+LoRA Configuration:
+  - Rank (r): 16
+  - Alpha (α): 16
+  - Dropout: 0.0
+  - Target: all-linear layers
+======================================================================
 
-✅ **Base Frozen**:
-```
+📊 Trainable Parameter Breakdown:
+
 ✓ Trainable LoRA parameters: 878
-✓ Trainable backbone parameters: 0 (all frozen ✓)
-```
+  - base_model.model.vision_backbone.featurizer.patch_embed.proj.lora_A.default.weight: 9,408 params
+  - base_model.model.vision_backbone.featurizer.patch_embed.proj.lora_B.default.weight: 16,384 params
+  - base_model.model.vision_backbone.featurizer.blocks.0.attn.qkv.lora_A.default.weight: 16,384 params
+  - ... and 875 more
 
-✅ **Training Working**:
-```
-Epoch 1/10 → Policy Loss: -0.178017 | Clip Frac: 0.8984
-```
+✓ Trainable backbone parameters: 0
+  - None (all frozen ✓)
 
-✅ **Gradients Stable**:
-```
-⚠️ Large gradient: 20.39 (clip at 1.0) - clipped and applied
-```
+✓ Other trainable parameters: 0
 
-✅ **Wandb Logging**:
-```
-✓ Logged 6 metrics to wandb
+📈 Total trainable in VLA: 55,414,144
+  - LoRA: 55,414,144 (100.0%)
+  - Backbone: 0 (0.0%)
+  - Other: 0 (0.0%)
 ```
 
 ---

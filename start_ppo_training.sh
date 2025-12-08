@@ -55,7 +55,7 @@ nohup bash -c '
         --task-id 0 \
         --timesteps 10000000 \
         --use-data-parallel \
-' > ppo_training.log 2>&1 &
+' > logs/ppo_training.log 2>&1 &
 
 # Get the PID
 TRAIN_PID=$!
@@ -64,7 +64,7 @@ TRAIN_PID=$!
 disown -a
 
 # Save PID
-echo $TRAIN_PID > ppo_train.pid
+echo $TRAIN_PID > logs/ppo_train.pid
 
 echo ""
 echo "✓ Training started with PID: $TRAIN_PID"

@@ -879,7 +879,19 @@ class OpenVLAPPO:
             output_hidden_states=True,
             return_dict=True,
         )
-        
+
+        # Extract hidden states for value function (GAE-PPO)
+        # Get last layer's hidden states: (batch_size, seq_len, hidden_dim=4096)
+        last_hidden_states = language_model_output.hidden_states[-1]
+
+        # Extract hidden state at the position right before action generation
+        # Position breakdown:
+        #   [0:NUM_PATCHES] - vision patch embeddings
+        #   [NUM_PATCHES:NUM_PATCHES+NUM_PROMPT_TOKENS] - instruction prompt tokens
+        #   [NUM_PATCHES+NUM_PROMPT_TOKENS:...] - action tokens (to be generated)
+        # We want the last prompt token's hidden state (has full vision + language context)
+        value_hidden_state = last_hidden_states[:, NUM_PATCHES + NUM_PROMPT_TOKENS - 1, :]  # (batch, 4096)
+
         # Extract logits for action tokens
         # Get logits at action token positions
         action_logits = language_model_output.logits[
@@ -932,6 +944,7 @@ class OpenVLAPPO:
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'pixel_values': pixel_values,
+            'hidden_states': value_hidden_state[0],  # (4096,) - for value head input
         }
     
     def _should_use_l1_actions(self) -> bool:
@@ -1340,12 +1353,18 @@ class OpenVLAPPO:
                         
                         # Compute value estimate if using GAE
                         if self.cfg.use_gae:
-                            # Get hidden states from VLA
-                            hidden_states = self.actor.vla.get_hidden_states(
-                                obs_dict=actor_obs,
-                                instruction=task_prompts[env_idx],
-                            )
-                            value_estimate = self.value_head(hidden_states).item()
+                            # Use cached hidden states from action_info
+                            if 'hidden_states' in action_info:
+                                hidden_states = action_info['hidden_states']
+                                value_estimate = self.value_head(hidden_states).item()
+                            else:
+                                # Fallback: compute hidden states (shouldn't happen with tokenized actions)
+                                print("WARNING: hidden_states not in action_info, computing from scratch")
+                                hidden_states = self.actor.vla.get_hidden_states(
+                                    obs_dict=actor_obs,
+                                    instruction=task_prompts[env_idx],
+                                )
+                                value_estimate = self.value_head(hidden_states).item()
                         else:
                             value_estimate = 0.0  # GRPO doesn't use values
 
@@ -1468,7 +1487,24 @@ class OpenVLAPPO:
                     if should_add_chunk:
                         # Compute chunk reward (use sparse reward if done, else 0)
                         chunk_reward = sparse_reward if done else 0.0
-                        
+
+                        # Compute value estimate if using GAE
+                        if self.cfg.use_gae:
+                            # Use cached hidden states from action_info
+                            if 'hidden_states' in self.current_action_info:
+                                hidden_states = self.current_action_info['hidden_states']
+                                value_estimate = self.value_head(hidden_states).item()
+                            else:
+                                # Fallback: compute hidden states (shouldn't happen with tokenized actions)
+                                print("WARNING: hidden_states not in action_info, computing from scratch")
+                                hidden_states = self.actor.vla.get_hidden_states(
+                                    obs_dict=self.current_actor_obs,
+                                    instruction=task_prompts[0],
+                                )
+                                value_estimate = self.value_head(hidden_states).item()
+                        else:
+                            value_estimate = 0.0  # GRPO doesn't use values
+
                         # Add ONCE per chunk to trajectory buffer
                         self.trajectory_buffer.add(
                             obs=self.current_actor_obs,
@@ -1481,7 +1517,7 @@ class OpenVLAPPO:
                             l1_action=self.current_l1_actions_chunk,  # Full (8, 7) or None
                             reward=chunk_reward,
                             done=done,
-                            value=0.0,
+                            value=value_estimate,
                             old_log_prob=self.current_action_info['log_prob'],
                         )
                         
@@ -1808,14 +1844,24 @@ class OpenVLAPPO:
                 # ==================== VALUE LOSS (GAE only) ====================
                 if self.cfg.use_gae:
                     # Compute value estimates for the minibatch
+                    # We need to run forward pass through VLA to get hidden states
+                    # Then pass those hidden states to the value head
                     batch_values = []
                     for i, idx in enumerate(mb_indices_cpu):
                         obs = data["observations"][idx.item()]
-                        # Get hidden states from VLA
-                        hidden_states = self.actor.vla.get_hidden_states(
-                            obs_dict=obs,
-                            instruction=task_prompt,
+                        responses_tensor = data["responses"][idx.item()]
+
+                        # Get action data (includes hidden states as a side effect)
+                        # This recomputes the forward pass but is necessary for gradients
+                        action_data = self.predict_action_tokens_with_grad(
+                            obs=obs,
+                            task_prompt=task_prompt,
+                            temperature=self.cfg.rollout_temperature,
+                            sample=False,  # Deterministic for value estimation
                         )
+
+                        # Extract hidden states and compute value
+                        hidden_states = action_data['hidden_states']
                         value_est = self.value_head(hidden_states)
                         batch_values.append(value_est)
 

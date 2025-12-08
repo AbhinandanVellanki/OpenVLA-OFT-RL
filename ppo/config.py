@@ -181,7 +181,7 @@ class PPOConfig:
     true reinforcement learning once the tokenized policy is competent.
     """
     
-    l1_warmup_steps: int = 5000
+    l1_warmup_steps: int = 25000
     """Number of steps to use L1 actions for rollouts (behavior cloning phase).
     During warmup:
     - L1 head generates high-quality actions (frozen)
@@ -195,7 +195,7 @@ class PPOConfig:
     - 0: Skip warmup (not recommended, tokenized starts from scratch)
     """
     
-    l1_transition_steps: int = 5000
+    l1_transition_steps: int = 10000
     """Number of steps for gradual transition from L1 to tokenized actions.
     Uses epsilon-greedy policy:
     - Start of transition: 100% L1, 0% tokenized

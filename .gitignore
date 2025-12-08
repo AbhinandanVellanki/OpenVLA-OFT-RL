@@ -13,3 +13,5 @@ libero_observations
 **.pid
 wandb/*
 **.log
+
+baselines/*

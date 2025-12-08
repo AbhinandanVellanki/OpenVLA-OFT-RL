@@ -77,11 +77,30 @@ class TrajectoryBuffer:
         
         if done:
             # Finalize trajectory and add to buffer
+            # Pad input_ids and attention_mask to max length in trajectory for stacking
+            input_ids_list = self.current_trajectory['input_ids']
+            attention_mask_list = self.current_trajectory['attention_mask']
+            
+            # Find max length
+            max_len = max(ids.shape[1] for ids in input_ids_list)
+            
+            # Pad all tensors to max length
+            padded_input_ids = []
+            padded_attention_masks = []
+            for ids, mask in zip(input_ids_list, attention_mask_list):
+                pad_len = max_len - ids.shape[1]
+                if pad_len > 0:
+                    # Pad with 0 for input_ids and 0 for attention_mask (ignore padding)
+                    ids = torch.nn.functional.pad(ids, (0, pad_len), value=0)
+                    mask = torch.nn.functional.pad(mask, (0, pad_len), value=0)
+                padded_input_ids.append(ids)
+                padded_attention_masks.append(mask)
+            
             trajectory = {
                 'observations': self.current_trajectory['observations'].copy(),
                 'responses': torch.stack(self.current_trajectory['responses']).detach(),
-                'input_ids': torch.stack(self.current_trajectory['input_ids']).detach(),
-                'attention_mask': torch.stack(self.current_trajectory['attention_mask']).detach(),
+                'input_ids': torch.stack(padded_input_ids).detach(),
+                'attention_mask': torch.stack(padded_attention_masks).detach(),
                 'pixel_values': torch.stack(self.current_trajectory['pixel_values']).detach(),
                 'proprio': np.stack(self.current_trajectory['proprio']) if self.current_trajectory['proprio'][0] is not None else None,
                 'actions': np.stack(self.current_trajectory['actions']),
@@ -106,11 +125,30 @@ class TrajectoryBuffer:
         Called at end of rollout collection if trajectory is incomplete.
         """
         if self.episode_step > 0:
+            # Pad input_ids and attention_mask to max length in trajectory for stacking
+            input_ids_list = self.current_trajectory['input_ids']
+            attention_mask_list = self.current_trajectory['attention_mask']
+            
+            # Find max length
+            max_len = max(ids.shape[1] for ids in input_ids_list)
+            
+            # Pad all tensors to max length
+            padded_input_ids = []
+            padded_attention_masks = []
+            for ids, mask in zip(input_ids_list, attention_mask_list):
+                pad_len = max_len - ids.shape[1]
+                if pad_len > 0:
+                    # Pad with 0 for input_ids and 0 for attention_mask (ignore padding)
+                    ids = torch.nn.functional.pad(ids, (0, pad_len), value=0)
+                    mask = torch.nn.functional.pad(mask, (0, pad_len), value=0)
+                padded_input_ids.append(ids)
+                padded_attention_masks.append(mask)
+            
             trajectory = {
                 'observations': self.current_trajectory['observations'].copy(),
                 'responses': torch.stack(self.current_trajectory['responses']).detach(),
-                'input_ids': torch.stack(self.current_trajectory['input_ids']).detach(),
-                'attention_mask': torch.stack(self.current_trajectory['attention_mask']).detach(),
+                'input_ids': torch.stack(padded_input_ids).detach(),
+                'attention_mask': torch.stack(padded_attention_masks).detach(),
                 'pixel_values': torch.stack(self.current_trajectory['pixel_values']).detach(),
                 'proprio': np.stack(self.current_trajectory['proprio']) if self.current_trajectory['proprio'][0] is not None else None,
                 'actions': np.stack(self.current_trajectory['actions']),

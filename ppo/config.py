@@ -37,12 +37,29 @@ class PPOConfig:
     
     batch_size: int = 2
     """Minibatch size for SGD updates during policy optimization.
-    With n_steps=128, batch_size=2 provides maximum memory efficiency while maintaining some gradient stability.
-    - Larger batches (4-8): More stable gradients, higher memory
-    - Smaller batches (1-2): Lower memory, more noise
-    Must divide evenly into n_steps for best results.
     
-    Using batch_size=2 to avoid OOM with 7B LoRA model during backward pass.
+    CRITICAL: DataParallel REPLICATES the model on each GPU (doesn't split it).
+    Only the batch is split across GPUs.
+    
+    Memory usage per GPU with DataParallel:
+    - Model replica: ~18-20GB (FULL model on EACH GPU)
+    - Batch forward: Split (batch_size/2 samples per GPU)
+    - Gradients: ~2-3GB (synchronized across GPUs)
+    - Gradient checkpointing overhead: Extra activations stored
+    
+    batch_size=2 (current, SAFEST):
+    - Each GPU: Model (18GB) + 1 sample (~1GB) + gradients (2GB) = ~21GB ✓
+    - Safe for 24GB GPUs with memory fragmentation
+    - Minimal parallelism but stable
+    - 512/2 = 256 minibatches/epoch
+    
+    batch_size=4 (CAUSES OOM):
+    - Each GPU: Model (18GB) + 2 samples (~1.5GB) + gradients (2GB) = ~21.5GB
+    - With fragmentation and checkpointing overhead → OOM ✗
+    
+    Note: DataParallel doesn't provide significant speedup with batch_size=2
+    since each GPU only processes 1 sample. Consider disabling DataParallel
+    if memory is tight, or switching to pipeline parallelism.
     """
     
     n_epochs: int = 10
@@ -150,6 +167,48 @@ class PPOConfig:
     - 0.01: Standard value for continuous control
     - 0.001-0.1: Typical range
     Note: Currently not used since VLA is deterministic, but kept for future stochastic versions.
+    """
+    
+    # === L1 Warmstart Configuration ===
+    use_l1_warmstart: bool = True
+    """Enable L1 warmstart before transitioning to tokenized RL.
+    When enabled, training proceeds in phases:
+    1. Warmup (0-l1_warmup_steps): Execute L1 actions, train tokenized to match (behavior cloning)
+    2. Transition (warmup_steps to warmup_steps+transition_steps): Gradually shift to tokenized
+    3. RL (after transition): Execute tokenized actions, train with true PPO
+    
+    This prevents the tokenized head from learning poorly initially and enables
+    true reinforcement learning once the tokenized policy is competent.
+    """
+    
+    l1_warmup_steps: int = 5000
+    """Number of steps to use L1 actions for rollouts (behavior cloning phase).
+    During warmup:
+    - L1 head generates high-quality actions (frozen)
+    - Environment executes L1 actions
+    - Tokenized head is trained to match L1 (supervised learning)
+    - Expected tokenized success rate: 0% → 40%
+    
+    Recommended values:
+    - 25000: Standard warmup (25k steps ≈ 500-1000 episodes)
+    - 50000: Extended warmup for complex tasks
+    - 0: Skip warmup (not recommended, tokenized starts from scratch)
+    """
+    
+    l1_transition_steps: int = 5000
+    """Number of steps for gradual transition from L1 to tokenized actions.
+    Uses epsilon-greedy policy:
+    - Start of transition: 100% L1, 0% tokenized
+    - Middle: 50% L1, 50% tokenized
+    - End: 0% L1, 100% tokenized
+    
+    This prevents catastrophic forgetting and ensures smooth handoff.
+    Expected tokenized success rate during transition: 40% → 50%
+    
+    Recommended values:
+    - 5000: Standard transition
+    - 10000: Slower transition for stability
+    - 0: Immediate switch (may cause performance drop)
     """
     
     value_loss_coef: float = 0.5

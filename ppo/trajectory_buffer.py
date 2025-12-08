@@ -32,6 +32,7 @@ class TrajectoryBuffer:
             'pixel_values': [],
             'proprio': [],
             'actions': [],  # Continuous actions (for environment)
+            'l1_actions': [],  # L1 regression actions (for BC targets)
             'rewards': [],
             'dones': [],
             'values': [],
@@ -48,6 +49,7 @@ class TrajectoryBuffer:
         pixel_values: torch.Tensor,
         proprio: Optional[np.ndarray],
         action: np.ndarray,  # Continuous action
+        l1_action: Optional[np.ndarray],  # L1 regression action (for BC)
         reward: float,
         done: bool,
         value: float,
@@ -65,6 +67,7 @@ class TrajectoryBuffer:
         self.current_trajectory['pixel_values'].append(pixel_values)
         self.current_trajectory['proprio'].append(proprio)
         self.current_trajectory['actions'].append(action)
+        self.current_trajectory['l1_actions'].append(l1_action)
         self.current_trajectory['rewards'].append(reward)
         self.current_trajectory['dones'].append(done)
         self.current_trajectory['values'].append(value)
@@ -82,6 +85,7 @@ class TrajectoryBuffer:
                 'pixel_values': torch.stack(self.current_trajectory['pixel_values']).detach(),
                 'proprio': np.stack(self.current_trajectory['proprio']) if self.current_trajectory['proprio'][0] is not None else None,
                 'actions': np.stack(self.current_trajectory['actions']),
+                'l1_actions': np.stack(self.current_trajectory['l1_actions']) if any(a is not None for a in self.current_trajectory['l1_actions']) else None,
                 'rewards': np.array(self.current_trajectory['rewards']),
                 'dones': np.array(self.current_trajectory['dones']),
                 'values': np.array(self.current_trajectory['values']),
@@ -110,6 +114,7 @@ class TrajectoryBuffer:
                 'pixel_values': torch.stack(self.current_trajectory['pixel_values']).detach(),
                 'proprio': np.stack(self.current_trajectory['proprio']) if self.current_trajectory['proprio'][0] is not None else None,
                 'actions': np.stack(self.current_trajectory['actions']),
+                'l1_actions': np.stack(self.current_trajectory['l1_actions']) if any(a is not None for a in self.current_trajectory['l1_actions']) else None,
                 'rewards': np.array(self.current_trajectory['rewards']),
                 'dones': np.array(self.current_trajectory['dones']),
                 'values': np.array(self.current_trajectory['values']),
@@ -247,6 +252,7 @@ class TrajectoryBuffer:
             'pixel_values': torch.cat([traj['pixel_values'] for traj in self.trajectories]),
             'proprio': np.concatenate([traj['proprio'] for traj in self.trajectories if traj['proprio'] is not None]) if self.trajectories[0]['proprio'] is not None else None,
             'actions': np.concatenate([traj['actions'] for traj in self.trajectories]),
+            'l1_actions': np.concatenate([traj['l1_actions'] for traj in self.trajectories if traj['l1_actions'] is not None]) if any(traj['l1_actions'] is not None for traj in self.trajectories) else None,
             'rewards': np.concatenate([traj['rewards'] for traj in self.trajectories]),
             'returns': np.concatenate([traj['returns'] for traj in self.trajectories]),
             'advantages': np.concatenate([traj['advantages'] for traj in self.trajectories]),

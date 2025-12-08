@@ -72,24 +72,16 @@ class OpenVLAPPO:
         self.cfg = ppo_config
         self.vla_config = vla_config
         
-        # ALWAYS use vla_config for device settings (single source of truth)
-        self.device = torch.device(vla_config.device)  # VLA backbone device
-        self.training_device = torch.device(vla_config.training_device)  # Training components device
+        # Set device from config
+        self.device = torch.device(vla_config.device)
+        self.training_device = self.device  # Same device for training
         
-        # CRITICAL: Set default CUDA device to match config (prevents cuda:0 defaults)
+        # Set default CUDA device
         if self.device.type == 'cuda':
             torch.cuda.set_device(self.device)
             print(f"✓ Set default CUDA device to {self.device}")
         
-        if vla_config.use_multi_gpu:
-            print(f"Multi-GPU Setup:")
-            print(f"  - VLA backbone on {self.device}")
-            print(f"  - Training components on {self.training_device}")
-        else:
-            print(f"Single-GPU Setup: All components on {self.device}")
-            if self.device != self.training_device:
-                print(f"  ⚠️  Warning: vla_config has different device ({self.device}) and training_device ({self.training_device})")
-                print(f"  ⚠️  For single-GPU mode, these should match. Check vla_config.gpu_id and vla_config.secondary_gpu_id")
+        print(f"Device: {self.device}")
         
         # Initialize OpenVLA actor
         print("Initializing OpenVLA actor...")
@@ -99,6 +91,10 @@ class OpenVLAPPO:
         if hasattr(self.actor.vla.language_model, 'gradient_checkpointing_enable'):
             self.actor.vla.language_model.gradient_checkpointing_enable()
             print("Enabled gradient checkpointing for memory efficiency")
+        
+        # Training stage tracking
+        self.training_stage = "warmup"  # "warmup", "transition", or "rl"
+        self.stage_step = 0  # Steps within current stage
         
         # Initialize action tokenizer
         print("Initializing action tokenizer...")
@@ -110,20 +106,22 @@ class OpenVLAPPO:
         )
         
         # Add bin_centers and vocab_size to VLA model for compatibility
-        self.actor.vla.bin_centers = self.action_tokenizer.bin_centers
-        self.actor.vla.vocab_size = self.action_tokenizer.vocab_size
+        # Access unwrapped model (in case of DataParallel)
+        vla_model = self.actor.vla.module if isinstance(self.actor.vla, nn.DataParallel) else self.actor.vla
+        vla_model.bin_centers = self.action_tokenizer.bin_centers
+        vla_model.vocab_size = self.action_tokenizer.vocab_size
         print(f"  {self.action_tokenizer}")
         
         # Verify VLA has norm_stats loaded (done automatically in get_vla())
-        if hasattr(self.actor.vla, 'norm_stats') and self.actor.vla.norm_stats is not None:
-            print(f"✓ VLA norm_stats loaded: {list(self.actor.vla.norm_stats.keys())}")
+        if hasattr(vla_model, 'norm_stats') and vla_model.norm_stats is not None:
+            print(f"✓ VLA norm_stats loaded: {list(vla_model.norm_stats.keys())}")
         else:
             print("⚠ Warning: VLA norm_stats not loaded, unnormalization may fail")
         
         # Store unnorm_key for validation
         self.unnorm_key = "libero_spatial_no_noops"
 
-        # Apply LoRA if configured (independent of freezing)
+        # Apply LoRA if configured (MUST be done BEFORE DataParallel)
         if vla_config.use_lora:
             print("\n" + "="*70)
             print("Applying LoRA Adapters to VLA Model")
@@ -160,6 +158,27 @@ class OpenVLAPPO:
                 print("    Falling back to full VLA training")
                 print("="*70 + "\n")
                 vla_config.use_lora = False
+        
+        # Wrap in DataParallel if enabled (MUST be done AFTER LoRA)
+        if vla_config.use_data_parallel and torch.cuda.device_count() > 1:
+            print(f"\n{'='*70}")
+            print(f"🚀 Enabling DataParallel on {torch.cuda.device_count()} GPUs")
+            print(f"{'='*70}")
+            
+            # Wrap VLA backbone in DataParallel
+            self.actor.vla = nn.DataParallel(
+                self.actor.vla,
+                device_ids=list(range(torch.cuda.device_count())),
+                output_device=self.device.index if self.device.type == 'cuda' else 0,
+            )
+            
+            print(f"✓ Model replicated across GPUs: {list(range(torch.cuda.device_count()))}")
+            print(f"✓ Batch will be split across GPUs automatically")
+            print(f"✓ Output gathered on: {self.device}")
+            print(f"{'='*70}\n")
+        elif vla_config.use_data_parallel and torch.cuda.device_count() <= 1:
+            print(f"⚠️  DataParallel enabled but only {torch.cuda.device_count()} GPU(s) available")
+            print(f"   Running on single GPU: {self.device}")
         
         # Apply freezing strategy based on configuration
         if vla_config.freeze_vla_backbone and not vla_config.use_lora:
@@ -219,19 +238,22 @@ class OpenVLAPPO:
             print("🔒 Freezing Base VLA Backbone (LoRA adapters trainable)")
             print("="*70)
             
+            # Get unwrapped model for freezing (in case of DataParallel)
+            vla_model = self.actor.vla.module if isinstance(self.actor.vla, nn.DataParallel) else self.actor.vla
+            
             # Freeze vision backbone
-            for name, param in self.actor.vla.vision_backbone.named_parameters():
+            for name, param in vla_model.vision_backbone.named_parameters():
                 if 'lora' not in name.lower():
                     param.requires_grad = False
             
             # Freeze language model backbone (but NOT LoRA)
-            for name, param in self.actor.vla.language_model.named_parameters():
+            for name, param in vla_model.language_model.named_parameters():
                 if 'lora' not in name.lower():
                     param.requires_grad = False
             
             # Count trainable parameters
-            trainable = sum(p.numel() for p in self.actor.vla.parameters() if p.requires_grad)
-            total = sum(p.numel() for p in self.actor.vla.parameters())
+            trainable = sum(p.numel() for p in vla_model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in vla_model.parameters())
             
             print(f"✓ Frozen base backbone (7B parameters)")
             print(f"✓ LoRA adapters trainable: {trainable:,} parameters")
@@ -244,7 +266,7 @@ class OpenVLAPPO:
             backbone_params = []
             other_params = []
             
-            for name, param in self.actor.vla.named_parameters():
+            for name, param in vla_model.named_parameters():
                 if param.requires_grad:
                     if 'lora' in name.lower():
                         lora_params.append((name, param.numel()))
@@ -347,15 +369,21 @@ class OpenVLAPPO:
         print(f"  - Clip ratios: high={ppo_config.clip_ratio_high}, low={ppo_config.clip_ratio_low}")
         print(f"  - GRPO gamma: {ppo_config.verifier_gamma}")
         print(f"  - KL coefficient: {ppo_config.kl_coef}")
-        print(f"  - Device mode: {'Multi-GPU' if vla_config.use_multi_gpu else 'Single-GPU'}")
-        if vla_config.use_multi_gpu:
-            print(f"    * VLA backbone ({vla_config.device}): {'LoRA adapters' if vla_config.use_lora else 'frozen'}")
-            print(f"    * Training components ({vla_config.training_device})")
+        print(f"  - Device: {self.device}")
+        if vla_config.use_data_parallel and torch.cuda.device_count() > 1:
+            print(f"  - Multi-GPU: DataParallel on {torch.cuda.device_count()} GPUs")
+        else:
+            print(f"  - Multi-GPU: Disabled (single GPU)")
         
         # Important: Confirm action head configuration for training
         if self.actor.l1_action_head:
             print(f"\n✓ Training will use L1 action head (same as validation) for rollouts")
             print(f"  This ensures consistent 80% success rate during training!")
+    
+    @property
+    def vla_unwrapped(self):
+        """Get the underlying VLA model, unwrapping DataParallel if needed."""
+        return self.actor.vla.module if isinstance(self.actor.vla, nn.DataParallel) else self.actor.vla
     
     def get_action(
         self,
@@ -405,6 +433,9 @@ class OpenVLAPPO:
         # Process observation for VLA
         prompt = f"In: What action should the robot take to {task_prompt.lower()}?\nOut:"
         
+        # Get unwrapped VLA model for method calls
+        vla_model = self.vla_unwrapped
+        
         # Get image (already PIL Image or list of PIL Images from processing)
         image = obs['image']
         
@@ -432,11 +463,12 @@ class OpenVLAPPO:
         
         # Process proprioception if available
         proprio = None
+        vla_model = self.vla_unwrapped
         if self.vla_config.use_proprio and obs.get('proprio') is not None:
             proprio = obs['proprio']
             # Normalize proprio using VLA's norm_stats
-            if hasattr(self.actor.vla, 'norm_stats') and self.unnorm_key in self.actor.vla.norm_stats:
-                proprio_stats = self.actor.vla.norm_stats[self.unnorm_key].get('proprio')
+            if hasattr(vla_model, 'norm_stats') and self.unnorm_key in vla_model.norm_stats:
+                proprio_stats = vla_model.norm_stats[self.unnorm_key].get('proprio')
                 if proprio_stats is not None:
                     # Normalize: (proprio - mean) / std
                     mean = np.array(proprio_stats['mean'])
@@ -447,25 +479,28 @@ class OpenVLAPPO:
             if not isinstance(proprio, np.ndarray):
                 proprio = np.array(proprio, dtype=np.float32)
         
-        # Call VLA's predict_action (with L1 action head if available)
-        if self.actor.l1_action_head is not None:
-            # Use L1 regression head for continuous actions
-            actions, _ = self.actor.vla.predict_action(
-                **inputs,
-                unnorm_key=self.unnorm_key,
-                do_sample=False,  # Greedy for validation
-                proprio=proprio,
-                proprio_projector=self.actor.proprio_projector,
-                action_head=self.actor.l1_action_head,
-                use_film=False,
-            )
-        else:
-            # Standard tokenized action prediction
-            actions, _ = self.actor.vla.predict_action(
-                **inputs,
-                unnorm_key=self.unnorm_key,
-                do_sample=False,  # Greedy for validation
-            )
+        # Call VLA's predict_action (works with DataParallel)
+        # Set eval mode for validation
+        self.actor.vla.eval()
+        with torch.no_grad():
+            if self.actor.l1_action_head is not None:
+                # Use L1 regression head for continuous actions
+                actions, _ = vla_model.predict_action(
+                    **inputs,
+                    unnorm_key=self.unnorm_key,
+                    do_sample=False,  # Greedy for validation
+                    proprio=proprio,
+                    proprio_projector=self.actor.proprio_projector,
+                    action_head=self.actor.l1_action_head,
+                    use_film=False,
+                )
+            else:
+                # Standard tokenized action prediction
+                actions, _ = vla_model.predict_action(
+                    **inputs,
+                    unnorm_key=self.unnorm_key,
+                    do_sample=False,  # Greedy for validation
+                )
         
         # Convert to numpy if needed
         if isinstance(actions, torch.Tensor):
@@ -530,11 +565,12 @@ class OpenVLAPPO:
         
         # Process proprioception if available
         proprio = None
+        vla_model = self.vla_unwrapped
         if self.vla_config.use_proprio and obs.get('proprio') is not None:
             proprio = obs['proprio']
             # Normalize proprio using VLA's norm_stats
-            if hasattr(self.actor.vla, 'norm_stats') and self.unnorm_key in self.actor.vla.norm_stats:
-                proprio_stats = self.actor.vla.norm_stats[self.unnorm_key].get('proprio')
+            if hasattr(vla_model, 'norm_stats') and self.unnorm_key in vla_model.norm_stats:
+                proprio_stats = vla_model.norm_stats[self.unnorm_key].get('proprio')
                 if proprio_stats is not None:
                     # Normalize: (proprio - mean) / std
                     mean = np.array(proprio_stats['mean'])
@@ -546,8 +582,10 @@ class OpenVLAPPO:
                 proprio = np.array(proprio, dtype=np.float32)
         
         # Get actions from L1 head (deterministic, high-quality actions)
+        # Set eval mode and use unwrapped model
+        self.actor.vla.eval()
         with torch.no_grad():
-            actions, _ = self.actor.vla.predict_action(
+            actions, _ = vla_model.predict_action(
                 **inputs,
                 unnorm_key=self.unnorm_key,
                 do_sample=False,  # Greedy for consistency
@@ -597,6 +635,7 @@ class OpenVLAPPO:
             'attention_mask': inputs['attention_mask'],
             'pixel_values': inputs['pixel_values'],
             'proprio': proprio,
+            'l1_action': actions,  # Store raw L1 actions for BC targets
         }
         
         return actions, info
@@ -732,13 +771,16 @@ class OpenVLAPPO:
         # Get number of prompt tokens
         NUM_PROMPT_TOKENS = input_ids.shape[-1] - 1
         
+        # Unwrap DataParallel for method calls
+        vla_model = self.vla_unwrapped
+        
         # Prepare inputs (add action tokens)
-        input_ids, attention_mask = self.actor.vla._prepare_input_for_action_prediction(input_ids, attention_mask)
-        labels = self.actor.vla._prepare_labels_for_action_prediction(labels, input_ids)
+        input_ids, attention_mask = vla_model._prepare_input_for_action_prediction(input_ids, attention_mask)
+        labels = vla_model._prepare_labels_for_action_prediction(labels, input_ids)
         
         # Get input embeddings and action masks
-        input_embeddings = self.actor.vla.get_input_embeddings()(input_ids)
-        all_actions_mask = self.actor.vla._process_action_masks(labels)
+        input_embeddings = vla_model.get_input_embeddings()(input_ids)
+        all_actions_mask = vla_model._process_action_masks(labels)
         
         # Extract language embeddings
         language_embeddings = input_embeddings[~all_actions_mask].reshape(
@@ -747,17 +789,17 @@ class OpenVLAPPO:
         
         # Process vision features
         use_film = False  # Our model doesn't use FiLM
-        projected_patch_embeddings = self.actor.vla._process_vision_features(pixel_values, language_embeddings, use_film)
+        projected_patch_embeddings = vla_model._process_vision_features(pixel_values, language_embeddings, use_film)
         
         # Add proprio if available
         if self.actor.proprio_projector is not None and proprio is not None:
             proprio_tensor = torch.from_numpy(proprio).to(projected_patch_embeddings.device, dtype=projected_patch_embeddings.dtype)
-            projected_patch_embeddings = self.actor.vla._process_proprio_features(
+            projected_patch_embeddings = vla_model._process_proprio_features(
                 projected_patch_embeddings, proprio_tensor, self.actor.proprio_projector
             )
         
         # Calculate number of patches
-        NUM_PATCHES = self.actor.vla.vision_backbone.get_num_patches() * self.actor.vla.vision_backbone.get_num_images_in_input()
+        NUM_PATCHES = vla_model.vision_backbone.get_num_patches() * vla_model.vision_backbone.get_num_images_in_input()
         if self.actor.proprio_projector is not None and proprio is not None:
             NUM_PATCHES += 1
         
@@ -766,12 +808,12 @@ class OpenVLAPPO:
         input_embeddings = input_embeddings * ~all_actions_mask
         
         # Build multimodal embeddings
-        multimodal_embeddings, multimodal_attention_mask = self.actor.vla._build_multimodal_attention(
+        multimodal_embeddings, multimodal_attention_mask = vla_model._build_multimodal_attention(
             input_embeddings, projected_patch_embeddings, attention_mask
         )
         
         # Forward through language model
-        language_model_output = self.actor.vla.language_model(
+        language_model_output = vla_model.language_model(
             input_ids=None,
             attention_mask=multimodal_attention_mask,
             position_ids=None,
@@ -793,8 +835,8 @@ class OpenVLAPPO:
         ]
         
         # Extract last 256 tokens (action vocabulary)
-        # Following reference: logits[..., -256-64:-64]
-        action_token_logits = action_logits[..., -256-64:-64]  # Shape: (batch, seq_len, 256)
+        # FIXED: Should be [-256:] not [-256-64:-64] to get tokens 31744-32000
+        action_token_logits = action_logits[..., -256:]  # Shape: (batch, seq_len, 256)
         
         # Sample or take argmax (greedy)
         if sample and temperature > 0:
@@ -838,6 +880,320 @@ class OpenVLAPPO:
             'pixel_values': pixel_values,
         }
     
+    def _should_use_l1_actions(self) -> bool:
+        """
+        Determine whether to use L1 or tokenized actions for rollouts based on training phase.
+        
+        Training phases:
+        1. Warmup (0 to l1_warmup_steps): Use L1 actions (behavior cloning)
+        2. Transition (warmup to warmup+transition): Epsilon-greedy mixing
+        3. RL (after transition): Use tokenized actions (true PPO)
+        
+        Returns:
+            True if should use L1 actions, False if should use tokenized actions
+        """
+        if not self.cfg.use_l1_warmstart:
+            return False  # Warmstart disabled, always use tokenized
+        
+        if self.global_step < self.cfg.l1_warmup_steps:
+            return True  # Warmup phase: use L1
+        elif self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
+            # Transition phase: epsilon-greedy
+            progress = (self.global_step - self.cfg.l1_warmup_steps) / self.cfg.l1_transition_steps
+            epsilon = 1.0 - progress  # 1.0 → 0.0 over transition period
+            return np.random.rand() < epsilon
+        else:
+            return False  # RL phase: use tokenized
+    
+    def _get_training_stage(self) -> str:
+        """
+        Determine current training stage based on global_step.
+        
+        Returns:
+            "warmup", "transition", or "rl"
+        """
+        if not self.cfg.use_l1_warmstart:
+            return "rl"
+        
+        if self.global_step < self.cfg.l1_warmup_steps:
+            return "warmup"
+        elif self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
+            return "transition"
+        else:
+            return "rl"
+    
+    def _update_training_stage(self):
+        """
+        Update training stage and log transition if stage changed.
+        """
+        new_stage = self._get_training_stage()
+        if new_stage != self.training_stage:
+            old_stage = self.training_stage
+            self.training_stage = new_stage
+            self.stage_step = 0
+            
+            # Log stage transition
+            print(f"\n{'='*70}")
+            print(f"🔄 STAGE TRANSITION: {old_stage.upper()} → {new_stage.upper()}")
+            print(f"   Global Step: {self.global_step}")
+            print(f"{'='*70}\n")
+            
+            if self.cfg.use_wandb:
+                try:
+                    wandb.log({
+                        "stage/transition": 1,
+                        "stage/name": new_stage,
+                        "stage/transition_step": self.global_step,
+                    }, step=self.global_step)
+                except Exception as e:
+                    print(f"⚠️  WARNING: Failed to log stage transition: {e}")
+        else:
+            self.stage_step += 1
+    
+    def _discretize_l1_actions(self, l1_actions: np.ndarray) -> torch.Tensor:
+        """
+        Convert L1 continuous actions to target token IDs for behavior cloning.
+        
+        Args:
+            l1_actions: (action_dim,) continuous actions from L1 head
+        
+        Returns:
+            target_tokens: (action_dim,) token IDs in [vocab_size-256, vocab_size)
+        """
+        # Use action tokenizer to discretize
+        token_ids = self.action_tokenizer.discretize_actions(l1_actions)
+        return torch.from_numpy(token_ids).long()
+    
+    def _bc_update_from_l1(self, task_prompt: str) -> Dict[str, float]:
+        """
+        Behavior cloning update: Train tokenized head to match L1 actions.
+        
+        Uses cross-entropy loss with L1 actions as ground truth targets.
+        This is more effective than PPO loss during warmup since L1 actions
+        are already near-optimal (80% success rate).
+        
+        Args:
+            task_prompt: Task description for VLA inputs
+        
+        Returns:
+            stats: Dictionary with training statistics
+        """
+        import gc
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+        
+        self.actor.vla.train()
+        # L1 action head stays in eval mode (used for generating targets)
+        if self.actor.l1_action_head is not None:
+            self.actor.l1_action_head.eval()
+        
+        # Get data from trajectory buffer
+        data = self.trajectory_buffer.get()
+        
+        if len(data['observations']) == 0:
+            return {"train/no_data": 1.0}
+        
+        # Extract L1 actions (these are the ground truth targets)
+        # l1_actions should be stored in the buffer during rollout
+        if 'l1_actions' not in data:
+            print("⚠️  WARNING: No L1 actions in buffer! Cannot perform BC update.")
+            print("    Falling back to PPO update...")
+            # Fall back to regular PPO (will implement after this works)
+            return {"train/no_l1_data": 1.0}
+        
+        l1_actions = data['l1_actions']  # List of (action_dim,) arrays
+        
+        print(f"\n{'='*70}")
+        print(f"🎯 BEHAVIOR CLONING UPDATE (Warmup Phase)")
+        print(f"   Training tokenized head to match L1 actions")
+        print(f"   Samples: {len(l1_actions)}")
+        print(f"{'='*70}\n")
+        
+        # Training statistics
+        stats = defaultdict(list)
+        
+        # Multiple epochs of optimization
+        epoch_pbar = tqdm(
+            range(self.cfg.n_epochs),
+            desc="BC update",
+            leave=False,
+            ncols=100,
+            bar_format='{l_bar}{bar}| Epoch {n_fmt}/{total_fmt}'
+        )
+        
+        for epoch in epoch_pbar:
+            if self.training_device.type == 'cuda':
+                torch.cuda.synchronize(self.training_device)
+            
+            # Generate random minibatch indices
+            indices = torch.randperm(len(l1_actions))
+            
+            # Calculate number of minibatches
+            num_minibatches = (len(l1_actions) + self.cfg.batch_size - 1) // self.cfg.batch_size
+            
+            # Progress bar for minibatches
+            minibatch_pbar = tqdm(
+                range(0, len(l1_actions), self.cfg.batch_size),
+                desc=f"  Epoch {epoch+1} minibatches",
+                leave=False,
+                ncols=100,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} batches',
+                total=num_minibatches
+            )
+            
+            # Process minibatches
+            for minibatch_idx, start_idx in enumerate(minibatch_pbar):
+                end_idx = min(start_idx + self.cfg.batch_size, len(l1_actions))
+                mb_indices = indices[start_idx:end_idx]
+                
+                # Zero gradients
+                self.actor_optimizer.zero_grad()
+                
+                total_bc_loss = 0.0
+                total_accuracy = 0.0
+                
+                # Process each sample in minibatch
+                for i, idx in enumerate(mb_indices):
+                    obs = data["observations"][idx.item()]
+                    l1_actions_chunk = l1_actions[idx.item()]  # Full chunk (8, 7)
+                    
+                    # Convert L1 actions chunk to target token IDs
+                    # Flatten to (56,) then discretize
+                    l1_actions_flat = l1_actions_chunk.flatten()  # (8, 7) -> (56,)
+                    target_tokens = self._discretize_l1_actions(l1_actions_flat).to(self.training_device)
+                    
+                    # Get action token logits from current policy (generates full chunk)
+                    action_data = self.predict_action_tokens_with_grad(
+                        obs, task_prompt, temperature=1.0, sample=False
+                    )
+                    
+                    # Extract logits for the 256 action tokens
+                    # logits shape: (1, 56, 256) for 8 actions × 7 dims
+                    logits_full = action_data['logits'][0]  # (56, 256)
+                    logits_full = logits_full.to(self.training_device)
+                    
+                    # Map target tokens to indices in [0, 255]
+                    target_indices = target_tokens - (self.action_tokenizer.vocab_size - 256)
+                    target_indices = target_indices.clamp(0, 255)  # Safety clamp
+                    
+                    # Cross-entropy loss: train all 8 actions at once
+                    # logits: (56, 256), targets: (56,)
+                    bc_loss = nn.functional.cross_entropy(logits_full, target_indices, reduction='mean')
+                    
+                    # Normalize by batch size for gradient accumulation
+                    (bc_loss / len(mb_indices)).backward()
+                    
+                    # Compute accuracy (percentage of correctly predicted bins across all 8 actions)
+                    with torch.no_grad():
+                        pred_indices = logits_full.argmax(dim=-1)
+                        accuracy = (pred_indices == target_indices).float().mean()
+                        total_accuracy += accuracy.item()
+                    
+                    total_bc_loss += bc_loss.item()
+                    
+                    # Clear intermediate data
+                    del action_data
+                
+                # Gradient clipping
+                actor_params = (
+                    [p for p in self.actor.vla.parameters() if p.requires_grad] +
+                    (list(self.actor.proprio_projector.parameters()) if self.actor.proprio_projector else [])
+                )
+                
+                # Check for NaN gradients
+                has_nan_grad = False
+                for p in actor_params:
+                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                        has_nan_grad = True
+                        break
+                
+                if has_nan_grad:
+                    print(f"\n⚠️  WARNING: NaN or inf detected in gradients! Skipping optimizer step.")
+                    self.actor_optimizer.zero_grad()
+                    continue
+                
+                # Clip gradients
+                total_norm = torch.nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
+                
+                if total_norm > self.max_grad_norm * 1000:
+                    print(f"\n⚠️  CRITICAL: Gradient explosion: {total_norm:.2f}")
+                    self.actor_optimizer.zero_grad()
+                    continue
+                
+                # Optimizer step
+                self.actor_optimizer.step()
+                
+                # Track statistics
+                n_samples = len(mb_indices)
+                avg_bc_loss = total_bc_loss / n_samples
+                avg_accuracy = total_accuracy / n_samples
+                
+                stats['train/bc_loss'].append(avg_bc_loss)
+                stats['train/bc_accuracy'].append(avg_accuracy)
+                
+                # Update progress bar
+                minibatch_pbar.set_postfix({
+                    'loss': f"{avg_bc_loss:.4f}",
+                    'acc': f"{avg_accuracy:.3f}",
+                }, refresh=False)
+                
+                # Clear CUDA cache
+                torch.cuda.empty_cache()
+            
+            minibatch_pbar.close()
+            
+            # Calculate epoch statistics
+            epoch_bc_loss = np.mean([s for s in stats['train/bc_loss'][-num_minibatches:]])
+            epoch_accuracy = np.mean([s for s in stats['train/bc_accuracy'][-num_minibatches:]])
+            
+            # Print epoch summary
+            print(f"\n  Epoch {epoch+1}/{self.cfg.n_epochs} → "
+                  f"BC Loss: {epoch_bc_loss:.6f} | "
+                  f"Accuracy: {epoch_accuracy:.4f}")
+            
+            # Update epoch progress bar
+            epoch_pbar.set_postfix({
+                'loss': f"{epoch_bc_loss:.4f}",
+                'acc': f"{epoch_accuracy:.3f}",
+            }, refresh=False)
+        
+        epoch_pbar.close()
+        
+        # Aggregate statistics
+        aggregated_stats = {
+            'train/bc_loss': np.mean(stats['train/bc_loss']),
+            'train/bc_accuracy': np.mean(stats['train/bc_accuracy']),
+        }
+        
+        print(f"\n✓ BC update complete:")
+        print(f"   Loss: {aggregated_stats['train/bc_loss']:.6f}")
+        print(f"   Accuracy: {aggregated_stats['train/bc_accuracy']:.4f}")
+        print(f"{'='*70}\n")
+        
+        # Clear trajectory buffer after update
+        self.trajectory_buffer.clear()
+        
+        return aggregated_stats
+    
+    def _get_rollout_policy_name(self) -> str:
+        """
+        Get human-readable name of current rollout policy for logging.
+        
+        Returns:
+            String describing current policy (e.g., "L1 (warmup)", "Tokenized (RL)")
+        """
+        if not self.cfg.use_l1_warmstart:
+            return "Tokenized (RL)"
+        
+        if self.global_step < self.cfg.l1_warmup_steps:
+            return "L1 (warmup)"
+        elif self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
+            progress = (self.global_step - self.cfg.l1_warmup_steps) / self.cfg.l1_transition_steps
+            return f"L1→Tokenized ({progress:.0%})"
+        else:
+            return "Tokenized (RL)"
+    
     def collect_rollouts(
         self,
         env,
@@ -848,6 +1204,11 @@ class OpenVLAPPO:
         
         Collects complete episodes, assigns sparse rewards only at episode completion,
         and stores action token IDs for PPO training.
+        
+        Implements phased training:
+        1. Warmup: Execute L1 actions, train tokenized to match (behavior cloning)
+        2. Transition: Gradually shift to tokenized actions (epsilon-greedy)
+        3. RL: Execute tokenized actions, train with true PPO
         
         Args:
             env: Single or vectorized LIBERO environment
@@ -967,13 +1328,30 @@ class OpenVLAPPO:
                             "proprio": processed_obs["proprio"],  # Use 8D axis-angle format
                         }
                         
-                        # Get action chunk (8 actions) using L1 head with log probs for PPO
-                        actions_chunk, action_info = self.get_action(
-                            actor_obs,
-                            task_prompts[0],
-                            temperature=self.cfg.rollout_temperature,
-                            use_builtin_predict=False,  # Use L1 head + log probs for training
-                        )
+                        # Choose policy based on training phase
+                        use_l1 = self._should_use_l1_actions()
+                        
+                        if use_l1:
+                            # Warmup/Transition: Get action chunk (8 actions) using L1 head
+                            actions_chunk, action_info = self.get_action(
+                                actor_obs,
+                                task_prompts[0],
+                                temperature=self.cfg.rollout_temperature,
+                                use_builtin_predict=False,  # Use L1 head + log probs for training
+                            )
+                            
+                            # During warmup, also store the L1 actions for BC targets
+                            # The action_info already contains 'l1_action' key from _get_action_l1_with_logprobs
+                            l1_actions_chunk = action_info.get('l1_action', actions_chunk)
+                        else:
+                            # RL phase: Get action chunk using tokenized head
+                            actions_chunk, action_info = self._get_action_via_tokens(
+                                actor_obs,
+                                task_prompts[0],
+                                temperature=self.cfg.rollout_temperature,
+                            )
+                            # No L1 actions in RL phase
+                            l1_actions_chunk = None
                         
                         # Initialize action queue with all 8 actions
                         from collections import deque
@@ -981,9 +1359,14 @@ class OpenVLAPPO:
                         for act in actions_chunk:
                             self.action_queue.append(act)
                         
-                        # Store action_info and observation separately (same for all actions in chunk)
+                        # Store action_info, observation, and full L1 chunk for this action chunk
+                        # We'll add to buffer ONCE per chunk, not per action
                         self.current_action_info = action_info
                         self.current_actor_obs = actor_obs
+                        self.current_actions_chunk = actions_chunk  # Store full chunk (8, 7)
+                        self.current_l1_actions_chunk = l1_actions_chunk  # Full (8, 7) array or None
+                        self.chunk_step_count = 0  # Track how many actions from this chunk we've executed
+                        self.chunk_rewards = []  # Collect rewards for all 8 steps
                     
                     # Pop action from queue and use stored observation/info
                     action = self.action_queue.popleft()
@@ -997,6 +1380,10 @@ class OpenVLAPPO:
                     next_obs, reward, terminated, truncated, info = env.step(action)
                     done = terminated or truncated
                     
+                    # Collect reward for this step in the chunk
+                    self.chunk_rewards.append(reward)
+                    self.chunk_step_count += 1
+                    
                     # Sparse rewards: zero intermediate rewards, only at finish
                     sparse_reward = 0.0
                     if done:
@@ -1005,29 +1392,45 @@ class OpenVLAPPO:
                         episode_successes.append(float(success))
                         episode_lengths.append(current_episode_length + 1)
                         current_episode_length = 0
-                        # Clear action queue, info, and observation on episode end
-                        self.action_queue.clear()
-                        self.current_action_info = None
-                        self.current_actor_obs = None
-                        obs, info = env.reset()
                     else:
                         current_episode_length += 1
                         obs = next_obs
                     
-                    # Add to trajectory buffer
-                    self.trajectory_buffer.add(
-                        obs=actor_obs,
-                        responses=action_info['responses'],
-                        input_ids=action_info['input_ids'],
-                        attention_mask=action_info['attention_mask'],
-                        pixel_values=action_info['pixel_values'],
-                        proprio=action_info['proprio'],
-                        action=action,
-                        reward=sparse_reward,
-                        done=done,
-                        value=0.0,  # GRPO mode: must provide value even if unused
-                        old_log_prob=action_info['log_prob'],
-                    )
+                    # Add to buffer when chunk is complete (all 8 actions executed) OR episode ends
+                    should_add_chunk = (self.chunk_step_count == 8) or done or len(self.action_queue) == 0
+                    
+                    if should_add_chunk:
+                        # Compute chunk reward (use sparse reward if done, else 0)
+                        chunk_reward = sparse_reward if done else 0.0
+                        
+                        # Add ONCE per chunk to trajectory buffer
+                        self.trajectory_buffer.add(
+                            obs=self.current_actor_obs,
+                            responses=self.current_action_info['responses'],
+                            input_ids=self.current_action_info['input_ids'],
+                            attention_mask=self.current_action_info['attention_mask'],
+                            pixel_values=self.current_action_info['pixel_values'],
+                            proprio=self.current_action_info['proprio'],
+                            action=self.current_actions_chunk,  # Store full chunk (8, 7)
+                            l1_action=self.current_l1_actions_chunk,  # Full (8, 7) or None
+                            reward=chunk_reward,
+                            done=done,
+                            value=0.0,
+                            old_log_prob=self.current_action_info['log_prob'],
+                        )
+                        
+                        # Reset chunk tracking
+                        self.chunk_step_count = 0
+                        self.chunk_rewards = []
+                    
+                    if done:
+                        # Clear action queue, info, and observation on episode end
+                        self.action_queue.clear()
+                        self.current_action_info = None
+                        self.current_actor_obs = None
+                        self.current_actions_chunk = None
+                        self.current_l1_actions_chunk = None
+                        obs, info = env.reset()
                     
                     steps_collected += 1
                     pbar.update(1)
@@ -1049,6 +1452,13 @@ class OpenVLAPPO:
             gamma=self.cfg.gamma,
             verifier_gamma=self.cfg.verifier_gamma,
         )
+        
+        # Log rollout policy for tracking training phase
+        rollout_policy = self._get_rollout_policy_name()
+        print(f"\n🎯 Rollout Policy: {rollout_policy}")
+        if self.cfg.use_l1_warmstart:
+            warmup_progress = min(1.0, self.global_step / self.cfg.l1_warmup_steps)
+            print(f"   Warmup Progress: {warmup_progress:.1%} ({self.global_step}/{self.cfg.l1_warmup_steps} steps)")
         
         # Debug: Check old log probabilities from rollout
         data_for_debug = self.trajectory_buffer.get()
@@ -1087,7 +1497,9 @@ class OpenVLAPPO:
     
     def update_policy(self, task_prompt: str) -> Dict[str, float]:
         """
-        Update policy using PPO with GRPO advantages and gradient accumulation.
+        Update policy using appropriate loss based on training stage:
+        - Warmup stage: Behavior cloning with cross-entropy loss (L1 actions as targets)
+        - Transition/RL stages: PPO with GRPO advantages
         
         Implements PPO policy gradient with:
         - Action token log probabilities
@@ -1099,6 +1511,12 @@ class OpenVLAPPO:
         Note: GRPO computes advantages directly from sparse rewards,
         no value function needed.
         """
+        # Check if we should use behavior cloning (warmup phase)
+        training_stage = self._get_training_stage()
+        if training_stage == "warmup":
+            return self._bc_update_from_l1(task_prompt)
+        
+        # Otherwise, use PPO loss (transition and RL phases)
         # Aggressive cleanup before training to prevent CUDA memory corruption
         import gc
         torch.cuda.empty_cache()
@@ -1404,13 +1822,118 @@ class OpenVLAPPO:
         # ...existing code...
         return {k: np.mean(v) for k, v in stats.items()}
     
+    def validate_tokenized(self, env, task_prompt: str) -> Dict[str, float]:
+        """
+        Run validation episodes using ONLY tokenized action head (no L1 head).
+        
+        This validates whether the tokenized action head has learned from the hybrid
+        training (where we execute L1 actions but train the tokenized head).
+        
+        Uses greedy (argmax) sampling from token distribution for deterministic evaluation.
+        """
+        # Set to eval mode
+        self.actor.vla.eval()
+        
+        # Memory cleanup
+        import gc
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+        
+        val_rewards = []
+        val_successes = []
+        
+        # Use inference_mode for deterministic evaluation
+        with torch.inference_mode():
+            for ep in tqdm(
+                range(self.cfg.val_episodes),
+                desc="Val (Tokenized)",
+                leave=False,
+                ncols=100,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} episodes'
+            ):
+                obs, info = env.reset()
+                episode_reward = 0
+                done = False
+                step_count = 0
+                
+                from collections import deque
+                action_queue = deque(maxlen=8)
+                
+                while not done:
+                    # Query policy if action queue is empty
+                    if len(action_queue) == 0:
+                        # Process observation (2 cameras)
+                        processed_obs = process_observation_for_vla(
+                            obs,
+                            camera_name="agentview",
+                            resize_size=self.cfg.image_size,
+                            num_images=2,
+                            center_crop=True,
+                            crop_scale=0.9,
+                            return_pil=True,
+                        )
+                        actor_obs = {
+                            "image": processed_obs["image"],
+                            "proprio": processed_obs["proprio"],
+                        }
+                        
+                        # Get actions from tokenized head ONLY (greedy sampling)
+                        action_data = self.predict_action_tokens_with_grad(
+                            actor_obs,
+                            task_prompt,
+                            temperature=0.0,  # Greedy (argmax)
+                            sample=False,     # Use argmax, not sampling
+                        )
+                        
+                        # Extract continuous action chunk (8, 7)
+                        actions_chunk = action_data['continuous_actions']
+                        
+                        # Fill action queue with all 8 actions
+                        for act in actions_chunk:
+                            action_queue.append(act)
+                    
+                    # Pop action from queue
+                    action = action_queue.popleft()
+                    
+                    # Process action for LIBERO (normalize + invert gripper)
+                    action = process_action_for_libero(action)
+                    
+                    # Step environment
+                    obs, reward, terminated, truncated, info = env.step(
+                        action.tolist() if hasattr(action, 'tolist') else action
+                    )
+                    episode_reward += reward
+                    done = terminated or truncated
+                    step_count += 1
+            
+                val_rewards.append(episode_reward)
+                val_successes.append(float(info.get("success", False)))
+                
+                # Clear cache periodically
+                if (ep + 1) % 2 == 0:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+        
+        # Final cleanup
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        return {
+            "val/tokenized_mean_reward": np.mean(val_rewards),
+            "val/tokenized_success_rate": np.mean(val_successes),
+        }
+    
     def validate(self, env, task_prompt: str) -> Dict[str, float]:
         """
         Run validation episodes to measure success rate.
         
-        Uses greedy (argmax) action selection for deterministic evaluation.
-        Uses single camera (same as training) for consistency.
-        Matches reference evaluation (run_libero_eval.py line 727).
+        Runs TWO types of validation:
+        1. L1 head validation (pretrained, deterministic)
+        2. Tokenized head validation (being trained via PPO)
+        
+        This allows us to track whether the tokenized head is learning from
+        the hybrid training approach (execute L1, train tokenized).
         """
         # Set to eval mode first
         self.actor.vla.eval()
@@ -1427,6 +1950,7 @@ class OpenVLAPPO:
         gc.collect()
         torch.cuda.empty_cache()
         
+        # === RUN L1 VALIDATION ===
         val_rewards = []
         val_successes = []
         
@@ -1434,7 +1958,7 @@ class OpenVLAPPO:
         with torch.inference_mode():
             for ep in tqdm(
                 range(self.cfg.val_episodes),
-                desc="Validation",
+                desc="Val (L1 Head)",
                 leave=False,
                 ncols=100,
                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} episodes'
@@ -1523,16 +2047,35 @@ class OpenVLAPPO:
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
         
-        # Final cleanup after validation
-        import gc
+        # Store L1 results
+        l1_metrics = {
+            "val/l1_mean_reward": np.mean(val_rewards),
+            "val/l1_success_rate": np.mean(val_successes),
+        }
+        
+        # Memory cleanup between validations
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         gc.collect()
         
-        return {
-            "val/mean_reward": np.mean(val_rewards),
-            "val/success_rate": np.mean(val_successes),
-        }
+        # === RUN TOKENIZED VALIDATION ===
+        print(f"\n[Validation] L1 Head: {l1_metrics['val/l1_success_rate']*100:.1f}% success")
+        tokenized_metrics = self.validate_tokenized(env, task_prompt)
+        print(f"[Validation] Tokenized Head: {tokenized_metrics['val/tokenized_success_rate']*100:.1f}% success")
+        
+        # Calculate gap
+        gap = l1_metrics['val/l1_success_rate'] - tokenized_metrics['val/tokenized_success_rate']
+        print(f"[Validation] Gap: {gap*100:.1f}% (tokenized needs to close this)")
+        
+        # Final cleanup
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        # Combine metrics
+        all_metrics = {**l1_metrics, **tokenized_metrics}
+        all_metrics['val/gap'] = gap
+        
+        return all_metrics
     
     def train(self):
         """Main training loop."""
@@ -1598,6 +2141,27 @@ class OpenVLAPPO:
                 print(f"  Run URL: {run.get_url()}")
                 print(f"  Entity: {self.cfg.wandb_entity if self.cfg.wandb_entity else 'default'}")
                 print(f"  Mode: {'offline' if wandb.run.mode == 'offline' else 'online'}")
+                
+                # Define custom metrics for stage separation
+                wandb.define_metric("global_step")
+                wandb.define_metric("warmup/stage_step")
+                wandb.define_metric("transition/stage_step")
+                wandb.define_metric("rl/stage_step")
+                
+                # Set all warmup metrics to use warmup/stage_step as x-axis
+                wandb.define_metric("warmup/*", step_metric="warmup/stage_step")
+                # Set all transition metrics to use transition/stage_step as x-axis
+                wandb.define_metric("transition/*", step_metric="transition/stage_step")
+                # Set all rl metrics to use rl/stage_step as x-axis
+                wandb.define_metric("rl/*", step_metric="rl/stage_step")
+                
+                # Keep global metrics on global_step
+                wandb.define_metric("val/*", step_metric="global_step")
+                wandb.define_metric("rollout/*", step_metric="global_step")
+                wandb.define_metric("stage/*", step_metric="global_step")
+                
+                print(f"✓ Configured custom metrics for stage separation")
+                print(f"  Stages: warmup, transition, rl")
                 print("="*70 + "\n")
                 
             except Exception as e:
@@ -1625,18 +2189,20 @@ class OpenVLAPPO:
         print("="*70)
         val_prompt = task_prompts[0] if isinstance(task_prompts, list) else task_prompts
         initial_val_stats = self.validate(env, val_prompt)
-        print(f"Initial Success Rate: {initial_val_stats['val/success_rate']:.2%}")
-        print(f"Initial Mean Reward: {initial_val_stats['val/mean_reward']:.3f}")
+        print(f"Initial L1 Success Rate: {initial_val_stats['val/l1_success_rate']:.2%}")
+        print(f"Initial Tokenized Success Rate: {initial_val_stats['val/tokenized_success_rate']:.2%}")
+        print(f"Initial Performance Gap: {initial_val_stats['val/gap']:.2%}")
         print("="*70 + "\n")
         
         # Log initial validation to wandb
         if self.cfg.use_wandb:
             try:
                 wandb.log({
-                    "val/success_rate": initial_val_stats['val/success_rate'],
-                    "val/mean_reward": initial_val_stats['val/mean_reward'],
+                    "val/l1_success_rate": initial_val_stats['val/l1_success_rate'],
+                    "val/tokenized_success_rate": initial_val_stats['val/tokenized_success_rate'],
+                    "val/gap": initial_val_stats['val/gap'],
                 }, step=0)
-                print(f"✓ Logged initial validation to wandb: success_rate={initial_val_stats['val/success_rate']:.2%}, mean_reward={initial_val_stats['val/mean_reward']:.3f}")
+                print(f"✓ Logged initial validation to wandb: L1={initial_val_stats['val/l1_success_rate']:.2%}, Tokenized={initial_val_stats['val/tokenized_success_rate']:.2%}, Gap={initial_val_stats['val/gap']:.2%}")
             except Exception as e:
                 print(f"⚠️  WARNING: Failed to log initial validation to wandb: {e}")
         
@@ -1651,6 +2217,9 @@ class OpenVLAPPO:
             bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
         )
         for update in pbar:
+            # Update training stage tracking
+            self._update_training_stage()
+            
             # Collect rollouts
             rollout_stats = self.collect_rollouts(env, task_prompts)
             
@@ -1659,9 +2228,30 @@ class OpenVLAPPO:
             update_prompt = task_prompts[0] if isinstance(task_prompts, list) else task_prompts
             train_stats = self.update_policy(update_prompt)
             
-            # Combine stats
-            stats = {**rollout_stats, **train_stats}
+            # Combine stats with stage prefixes
+            stats = {}
+            
+            # Add stage-prefixed metrics
+            stage = self.training_stage
+            for key, value in {**rollout_stats, **train_stats}.items():
+                # Skip already prefixed metrics
+                if "/" in key:
+                    stats[key] = value
+                else:
+                    stats[f"{stage}/{key}"] = value
+            
+            # Add global tracking metrics (not stage-specific)
             stats["global_step"] = self.global_step
+            stats["stage/current"] = stage
+            stats[f"{stage}/stage_step"] = self.stage_step
+            
+            # Add rollout policy tracking
+            if self.cfg.use_l1_warmstart:
+                stats["rollout/uses_l1"] = int(self._should_use_l1_actions())
+                stats["rollout/warmup_progress"] = min(1.0, self.global_step / self.cfg.l1_warmup_steps)
+                if self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
+                    transition_progress = max(0.0, (self.global_step - self.cfg.l1_warmup_steps) / self.cfg.l1_transition_steps)
+                    stats["rollout/transition_progress"] = transition_progress
             
             # Print policy loss after every update
             if "train/policy_loss" in train_stats:
@@ -1676,16 +2266,17 @@ class OpenVLAPPO:
                 val_prompt = task_prompts[0] if isinstance(task_prompts, list) else task_prompts
                 val_stats = self.validate(env, val_prompt)
                 stats.update(val_stats)
-                print(f"✓ Validation complete: Success Rate = {val_stats['val/success_rate']:.2%}")
+                print(f"✓ Validation complete: L1={val_stats['val/l1_success_rate']:.2%}, Tokenized={val_stats['val/tokenized_success_rate']:.2%}, Gap={val_stats['val/gap']:.2%}")
                 
                 # ALWAYS log validation metrics to wandb immediately
                 if self.cfg.use_wandb:
                     try:
                         wandb.log({
-                            "val/success_rate": val_stats['val/success_rate'],
-                            "val/mean_reward": val_stats['val/mean_reward'],
+                            "val/l1_success_rate": val_stats['val/l1_success_rate'],
+                            "val/tokenized_success_rate": val_stats['val/tokenized_success_rate'],
+                            "val/gap": val_stats['val/gap'],
                         }, step=self.global_step)
-                        print(f"✓ Logged validation metrics to wandb: success_rate={val_stats['val/success_rate']:.2%}, mean_reward={val_stats['val/mean_reward']:.3f}")
+                        print(f"✓ Logged validation metrics to wandb: L1={val_stats['val/l1_success_rate']:.2%}, Tokenized={val_stats['val/tokenized_success_rate']:.2%}, Gap={val_stats['val/gap']:.2%}")
                     except Exception as e:
                         print(f"⚠️  WARNING: Failed to log validation to wandb: {e}")
             
@@ -1876,8 +2467,8 @@ def main():
                        help="Total training timesteps")
     parser.add_argument("--no-wandb", action="store_true",
                        help="Disable wandb logging")
-    parser.add_argument("--use-multi-gpu", action="store_true",
-                       help="Use multi-GPU setup")
+    parser.add_argument("--use-data-parallel", action="store_true",
+                       help="Enable DataParallel for multi-GPU training")
     
     args = parser.parse_args()
     
@@ -1885,20 +2476,17 @@ def main():
     vla_config = OpenVLAActorConfig(
         load_l1_action_head=True,  # Load for validation (matches reference 98% eval)
         freeze_l1_action_head=True,  # Keep frozen for PPO (not trained)
+        use_data_parallel=args.use_data_parallel,  # Enable DataParallel if flag provided
     )
     
-    # Only override if explicitly provided via command line
-    if args.use_multi_gpu:
-        vla_config.use_multi_gpu = True
-    
-    # PPO configuration - device matches VLA training device from config
+    # PPO configuration
     ppo_config = PPOConfig(
         total_timesteps=args.timesteps,
         task_suite=args.task_suite,
         task_id=args.task_id,
         task_ids=args.task_ids,
         num_envs=args.num_envs,
-        device=vla_config.training_device,  # Use same device as VLA training components
+        device=vla_config.device,  # Use same device as VLA
         use_wandb=not args.no_wandb,
         wandb_entity='deeprl_ais'
     )

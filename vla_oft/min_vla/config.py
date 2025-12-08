@@ -15,44 +15,32 @@ class OpenVLAActorConfig:
     use_local: bool = True
 
     # GPU configuration
-    use_multi_gpu: bool = False  # Enable to split model across GPUs
-    gpu_id: int = 1  # Primary GPU for VLA backbone (vision + language model)
-    secondary_gpu_id: int = 1  # Secondary GPU for training components (action head, value head, gradients)
+    gpu_id: int = 0  # Primary GPU device (or first GPU if using DataParallel)
+    use_data_parallel: bool = False  # Enable DataParallel for multi-GPU training
     
     """
-    Multi-GPU Memory Distribution Strategy:
+    DataParallel Multi-GPU Strategy:
     
-    Single-GPU (use_multi_gpu=False) - Requires >32GB:
-    - GPU 0: Everything (~32GB during training)
+    Single-GPU (use_data_parallel=False):
+    - GPU {gpu_id}: Everything (~20-24GB during training with LoRA)
     
-    Multi-GPU (use_multi_gpu=True) - Works with 2x24GB:
-    - GPU 0 (~16-18GB):
-      * VLA backbone (vision encoder + LLM): ~14GB
-      * Forward pass activations: ~2-4GB
-      
-    - GPU 1 (~14-16GB):
-      * Action head + Proprio projector: ~100MB
-      * Value head (critic): ~5MB
-      * Gradients + optimizer states: ~12-14GB
-      * Training activations: ~2GB
+    DataParallel (use_data_parallel=True) - Uses all available GPUs:
+    - Automatically splits batches across GPUs
+    - Model replicated on each GPU
+    - True parallel training (2x speedup with 2 GPUs)
+    - Both GPUs work simultaneously on different batch samples
     
-    During training:
-    1. Forward pass on GPU 0 (VLA with LoRA adapters)
-    2. Transfer hidden states to GPU 1
-    3. Action head forward + backward on GPU 1 (gradients only here)
-    4. Value head forward + backward on GPU 1
-    5. Optimizer updates on GPU 1 only
+    Benefits of DataParallel:
+    - Simple to use (just wrap model in nn.DataParallel)
+    - Automatic batch splitting and gradient synchronization
+    - Near-linear speedup (1.8-2x with 2 GPUs)
+    - Works with existing training code
     
-    Benefits:
-    - GPU 0 stays light (backbone + LoRA, forward-only during inference)
-    - GPU 1 handles all training overhead
-    - Clean separation: inference vs training
-    - LoRA gradients stored on GPU 0 but optimizer state on GPU 1
-    
-    IMPORTANT: With LoRA enabled, both GPUs will have some gradients:
-    - GPU 0: LoRA adapter gradients (~2-4GB)
-    - GPU 1: Action head + Value head gradients (~12-14GB)
-    Total gradient memory is still manageable on 2x24GB.
+    Memory per GPU (2 GPUs with DataParallel):
+    - Each GPU: ~18-20GB
+    - Model replicated on both GPUs
+    - Gradients synchronized automatically
+    - Optimizer state on primary GPU only
     """
     
     # ===========================================
@@ -61,45 +49,17 @@ class OpenVLAActorConfig:
     
     @property
     def device(self) -> str:
-        """Primary device for VLA backbone (frozen during training).
-        Returns: 'cuda:0' by default
+        """Primary device for model.
+        Returns: 'cuda:{gpu_id}' or 'cpu'
         """
         return f"cuda:{self.gpu_id}" if self.gpu_id >= 0 else "cpu"
     
     @property
-    def action_head_device(self) -> str:
-        """Device for action head (trainable component).
-        Single-GPU: Same as VLA backbone
-        Multi-GPU: GPU 1 (secondary_gpu_id) for training
-        """
-        if self.use_multi_gpu:
-            return f"cuda:{self.secondary_gpu_id}" if self.secondary_gpu_id >= 0 else "cpu"
-        return self.device
-    
-    @property
-    def proprio_projector_device(self) -> str:
-        """Device for proprio projector.
-        Single-GPU: Same as VLA backbone
-        Multi-GPU: GPU 1 (keeps projector with action head)
-        """
-        if self.use_multi_gpu:
-            return f"cuda:{self.secondary_gpu_id}" if self.secondary_gpu_id >= 0 else "cpu"
-        return self.device
-    
-    @property
-    def value_head_device(self) -> str:
-        """Device for value head (critic, trainable for PPO).
-        Always on same device as action head for efficient training.
-        """
-        return self.action_head_device
-    
-    @property
     def training_device(self) -> str:
-        """Device where gradients and optimizer states live.
-        Multi-GPU: GPU 1 (all trainable components + gradients)
-        Single-GPU: Same as main device
+        """Device where training happens.
+        Same as main device (DataParallel handles multi-GPU automatically).
         """
-        return self.action_head_device
+        return self.device
 
     # ===========================================
     # Training Configuration
@@ -108,35 +68,7 @@ class OpenVLAActorConfig:
     freeze_vla_backbone: bool = True
     """Freeze VLA backbone (vision + language model) during training.
     
-    IMPORTANT: With LoRA enabled, gradients exist on BOTH GPUs:
-    
-    Multi-GPU with LoRA (use_multi_gpu=True, use_lora=True):
-    - GPU 0 (~18-20GB):
-      * VLA backbone: ~14GB
-      * LoRA adapter parameters: ~200MB
-      * LoRA gradients: ~2-4GB
-      * Forward pass activations: ~2GB
-      
-    - GPU 1 (~16-18GB):
-      * Action head: ~100MB
-      * Value head: ~5MB  
-      * Action head gradients: ~100MB
-      * Value head gradients: ~5MB
-      * Optimizer states: ~12-14GB (AdamW stores 2x params)
-      * Training activations: ~2GB
-    
-    Total trainable parameters with LoRA:
-    - LoRA adapters: ~110M params (1.45% of 7.6B)
-    - Action head: ~167M params
-    - Proprio projector: ~1.6M params
-    - Value head: ~4.7M params
-    Total: ~278M trainable parameters
-    
-    Gradient distribution:
-    - LoRA adapters: Gradients stored on GPU 0 (but optimizer state can be on GPU 1)
-    - Action/Value heads: Gradients on GPU 1
-    
-    - False (Recommended with LoRA for 2x24GB):
+    - False (Recommended with LoRA):
       * Use LoRA adapters to fine-tune language model efficiently
       * Only ~1-2% of model parameters trainable
       * Full model adaptation with minimal memory overhead
@@ -144,7 +76,6 @@ class OpenVLAActorConfig:
     - True (Fallback if LoRA fails):
       * Only train action head + value head
       * VLA backbone completely frozen (no gradients)
-      * Memory: ~16GB on GPU 0, ~16GB on GPU 1
       * Faster but less expressive
     
     With LoRA enabled (use_lora=True), you can keep this False to get

@@ -303,6 +303,33 @@ class PPOConfig:
     # Logging and Checkpointing
     # ===========================================
     
+    checkpoint_dir: str = "checkpoints"
+    """Directory to save model checkpoints.
+    
+    Checkpoints include:
+    - Periodic: checkpoint_stage_{stage}_update_{update}_step_{step}.pt
+    - Best: best_model_stage_{stage}_success_{rate}.pt
+    - Final: final_model_step_{step}.pt
+    
+    Default: "checkpoints" (relative to working directory)
+    Can be absolute path: "/path/to/checkpoints"
+    """
+    
+    save_interval: int = 5
+    """Save checkpoint every N policy updates.
+    
+    Checkpoints are saved with naming pattern:
+    checkpoint_stage_{stage}_update_{update}_step_{step}.pt
+    
+    Additionally, the best model (highest tokenized success rate) is saved as:
+    best_model_stage_{stage}_success_{rate}.pt
+    
+    The final model at training completion is saved as:
+    final_model_step_{step}.pt
+    
+    Default: 5 (save every 5 policy updates)
+    """
+    
     use_wandb: bool = True
     """Enable Weights & Biases logging for experiment tracking.
     Logs metrics like reward, success rate, value loss to wandb dashboard.
@@ -315,14 +342,6 @@ class PPOConfig:
     - 'username': Logs to personal account
     - 'team-name': Logs to team workspace
     Set this if you want to log to a specific entity.
-    """
-    
-    save_interval: int = 10000
-    """Save model checkpoint every N environment steps.
-    Checkpoints include VLA weights, value head, optimizers, and training state.
-    - 10000-50000: Regular checkpointing
-    - 100000+: Less frequent, saves disk space
-    Saved to ./checkpoints/ directory.
     """
     
     # ===========================================

@@ -355,6 +355,11 @@ class OpenVLAPPO:
         self.global_step = 0
         self.episode_count = 0
         
+        # Checkpoint tracking
+        self.best_success_rate = 0.0
+        self.best_checkpoint_path = None
+        self.update_count = 0  # Track number of policy updates
+        
         # Multi-task tracking
         self.is_vectorized = ppo_config.num_envs > 1
         
@@ -1606,6 +1611,7 @@ class OpenVLAPPO:
                 total_policy_loss = 0.0
                 total_clipfrac = 0.0
                 total_approx_kl = 0.0
+                total_entropy = 0.0
                 
                 # Collect all action data in a batch to minimize GPU transfers
                 batch_logits = []
@@ -1657,6 +1663,11 @@ class OpenVLAPPO:
                     log_prob = logprobs_from_logits(logits.unsqueeze(0), response_indices.unsqueeze(0))
                     # CRITICAL: Use mean to match rollout computation and prevent massive values
                     log_prob = log_prob.mean()  # Mean over action dimensions
+                    
+                    # Compute entropy from action distribution (measure of exploration)
+                    # H = -sum(p * log(p)) where p = softmax(logits)
+                    action_probs = torch.softmax(logits, dim=-1)  # (seq_len, 256)
+                    entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(dim=-1).mean()  # Mean over sequence
                     
                     # Check for NaN in computed log_prob
                     if torch.isnan(log_prob).any() or torch.isinf(log_prob).any():
@@ -1724,6 +1735,7 @@ class OpenVLAPPO:
                     
                     # Track statistics
                     total_policy_loss += policy_loss.item()
+                    total_entropy += entropy.item()
                     with torch.no_grad():
                         clipfrac = ((ratio - clipped_ratio).abs() > 1e-6).float().mean()
                         approx_kl = (old_log_prob - log_prob).mean()
@@ -1789,6 +1801,7 @@ class OpenVLAPPO:
                 stats['train/policy_loss'].append(total_policy_loss / n_samples)
                 stats['train/clipfrac'].append(total_clipfrac / n_samples)
                 stats['train/approx_kl'].append(total_approx_kl / n_samples)
+                stats['train/entropy'].append(total_entropy / n_samples)
                 
                 # Update minibatch progress bar with current stats
                 minibatch_pbar.set_postfix({
@@ -1805,12 +1818,14 @@ class OpenVLAPPO:
             epoch_policy_loss = np.mean([s for s in stats['train/policy_loss'][-num_minibatches:]])
             epoch_clipfrac = np.mean([s for s in stats['train/clipfrac'][-num_minibatches:]])
             epoch_approx_kl = np.mean([s for s in stats['train/approx_kl'][-num_minibatches:]])
+            epoch_entropy = np.mean([s for s in stats['train/entropy'][-num_minibatches:]])
             
             # Print epoch summary
             print(f"\n  Epoch {epoch+1}/{self.cfg.n_epochs} → "
                   f"Policy Loss: {epoch_policy_loss:.6f} | "
                   f"Clip Frac: {epoch_clipfrac:.4f} | "
-                  f"KL: {epoch_approx_kl:.6f}")
+                  f"KL: {epoch_approx_kl:.6f} | "
+                  f"Entropy: {epoch_entropy:.4f}")
             
             # Update epoch progress bar with average stats
             epoch_pbar.set_postfix({
@@ -2228,6 +2243,9 @@ class OpenVLAPPO:
             update_prompt = task_prompts[0] if isinstance(task_prompts, list) else task_prompts
             train_stats = self.update_policy(update_prompt)
             
+            # Increment update counter AFTER policy update
+            self.update_count += 1
+            
             # Combine stats with stage prefixes
             stats = {}
             
@@ -2268,6 +2286,32 @@ class OpenVLAPPO:
                 stats.update(val_stats)
                 print(f"✓ Validation complete: L1={val_stats['val/l1_success_rate']:.2%}, Tokenized={val_stats['val/tokenized_success_rate']:.2%}, Gap={val_stats['val/gap']:.2%}")
                 
+                # Check if this is the best model (based on tokenized success rate)
+                current_success = val_stats['val/tokenized_success_rate']
+                if current_success > self.best_success_rate:
+                    self.best_success_rate = current_success
+                    
+                    # Save best checkpoint
+                    best_filename = f"best_model_stage_{stage}_success_{current_success:.3f}.pt"
+                    metadata = {
+                        "success_rate": current_success,
+                        "l1_success_rate": val_stats['val/l1_success_rate'],
+                        "gap": val_stats['val/gap'],
+                        "global_step": self.global_step,
+                        "stage": stage,
+                    }
+                    
+                    print(f"\n🏆 New best model! Success rate: {current_success:.2%}")
+                    saved_path = self.save_checkpoint(best_filename, metadata=metadata)
+                    
+                    # Remove old best checkpoint if exists
+                    if self.best_checkpoint_path and self.best_checkpoint_path != saved_path:
+                        if self.best_checkpoint_path.exists():
+                            self.best_checkpoint_path.unlink()
+                            print(f"  Removed old best checkpoint: {self.best_checkpoint_path.name}")
+                    
+                    self.best_checkpoint_path = saved_path
+                
                 # ALWAYS log validation metrics to wandb immediately
                 if self.cfg.use_wandb:
                     try:
@@ -2275,23 +2319,37 @@ class OpenVLAPPO:
                             "val/l1_success_rate": val_stats['val/l1_success_rate'],
                             "val/tokenized_success_rate": val_stats['val/tokenized_success_rate'],
                             "val/gap": val_stats['val/gap'],
+                            "val/best_success_rate": self.best_success_rate,
                         }, step=self.global_step)
                         print(f"✓ Logged validation metrics to wandb: L1={val_stats['val/l1_success_rate']:.2%}, Tokenized={val_stats['val/tokenized_success_rate']:.2%}, Gap={val_stats['val/gap']:.2%}")
                     except Exception as e:
                         print(f"⚠️  WARNING: Failed to log validation to wandb: {e}")
+            
+            # Save periodic checkpoint every N updates (configurable)
+            if self.update_count > 0 and self.update_count % self.cfg.save_interval == 0:
+                periodic_filename = f"checkpoint_stage_{stage}_update_{self.update_count}_step_{self.global_step}.pt"
+                metadata = {
+                    "global_step": self.global_step,
+                    "update_count": self.update_count,
+                    "stage": stage,
+                    "rollout_success_rate": rollout_stats.get('rollout/success_rate', 0.0),
+                }
+                print(f"\n💾 Saving periodic checkpoint (update {self.update_count})...")
+                self.save_checkpoint(periodic_filename, metadata=metadata)
             
             # Update progress bar with stats
             pbar_stats = {
                 "step": self.global_step,
                 "succ": f"{stats['rollout/success_rate']:.1%}",
                 "traj": stats.get('rollout/num_trajectories', 0),
+                "best": f"{self.best_success_rate:.1%}",
             }
             if "train/policy_loss" in stats:
                 pbar_stats["π_loss"] = f"{stats['train/policy_loss']:.4f}"
             if "train/clipfrac" in stats:
                 pbar_stats["clip"] = f"{stats['train/clipfrac']:.3f}"
-            if "val/success_rate" in stats:
-                pbar_stats["val"] = f"{stats['val/success_rate']:.1%}"
+            if "val/tokenized_success_rate" in stats:
+                pbar_stats["val"] = f"{stats['val/tokenized_success_rate']:.1%}"
             pbar.set_postfix(pbar_stats, refresh=True)
             
             # Log to wandb after every policy update
@@ -2316,6 +2374,14 @@ class OpenVLAPPO:
                 if clean_stats:
                     try:
                         wandb.log(clean_stats, step=self.global_step)
+                        
+                        # Also log checkpoint info if periodic save happened
+                        if self.update_count % self.cfg.save_interval == 0:
+                            wandb.log({
+                                "checkpoint/update_count": self.update_count,
+                                "checkpoint/best_success_rate": self.best_success_rate,
+                            }, step=self.global_step)
+                        
                         # Print confirmation every 10 updates to avoid spam
                         if update % 10 == 0:
                             print(f"\n✓ Logged {len(clean_stats)} metrics to wandb at step {self.global_step}")
@@ -2326,13 +2392,20 @@ class OpenVLAPPO:
                             print(f"   Stats types: {[(k, type(v)) for k, v in stats.items()][:5]}...")  # First 5 only
                 else:
                     print(f"\n⚠️  WARNING: No valid stats to log (all NaN/inf) at update {update}")
-            
-            
-            # Save checkpoint
-            if self.global_step % self.cfg.save_interval == 0:
-                self.save_checkpoint(f"checkpoint_{self.global_step}.pt")
         
         pbar.close()
+        
+        # Save final checkpoint
+        print(f"\n💾 Saving final checkpoint...")
+        final_filename = f"final_model_step_{self.global_step}.pt"
+        final_metadata = {
+            "global_step": self.global_step,
+            "update_count": self.update_count,
+            "stage": self.training_stage,
+            "best_success_rate": self.best_success_rate,
+        }
+        self.save_checkpoint(final_filename, metadata=final_metadata)
+        
         env.close()
         
         if self.cfg.use_wandb:
@@ -2348,20 +2421,32 @@ class OpenVLAPPO:
         
         print("\n" + "="*70)
         print("Training completed!")
+        print(f"  Total updates: {self.update_count}")
+        print(f"  Best success rate: {self.best_success_rate:.2%}")
+        if self.best_checkpoint_path:
+            print(f"  Best checkpoint: {self.best_checkpoint_path.name}")
         print("="*70)
     
-    def save_checkpoint(self, filename: str):
+    def save_checkpoint(self, filename: str, metadata: dict = None):
         """Save model checkpoint with proper LoRA adapter handling."""
-        checkpoint_dir = Path("checkpoints")
-        checkpoint_dir.mkdir(exist_ok=True)
+        checkpoint_dir = Path(self.cfg.checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         checkpoint = {
             "global_step": self.global_step,
             "episode_count": self.episode_count,
+            "update_count": self.update_count,
+            "training_stage": self.training_stage,
+            "stage_step": self.stage_step,
+            "best_success_rate": self.best_success_rate,
             "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
             "vla_config": vars(self.vla_config),
             "ppo_config": vars(self.cfg),
         }
+        
+        # Add metadata (e.g., validation metrics)
+        if metadata:
+            checkpoint["metadata"] = metadata
         
         # Handle VLA model saving based on whether LoRA is used
         if self.vla_config.use_lora and not self.vla_config.freeze_vla_backbone:
@@ -2401,7 +2486,7 @@ class OpenVLAPPO:
     
     def load_checkpoint(self, filename: str):
         """Load model checkpoint with proper LoRA adapter handling."""
-        checkpoint_dir = Path("checkpoints")
+        checkpoint_dir = Path(self.cfg.checkpoint_dir)
         checkpoint_path = checkpoint_dir / filename
         
         if not checkpoint_path.exists():
@@ -2413,6 +2498,10 @@ class OpenVLAPPO:
         # Restore training state
         self.global_step = checkpoint["global_step"]
         self.episode_count = checkpoint["episode_count"]
+        self.update_count = checkpoint.get("update_count", 0)
+        self.training_stage = checkpoint.get("training_stage", "warmup")
+        self.stage_step = checkpoint.get("stage_step", 0)
+        self.best_success_rate = checkpoint.get("best_success_rate", 0.0)
         
         # Load VLA model based on checkpoint type
         if checkpoint.get("is_lora", False):
@@ -2447,7 +2536,15 @@ class OpenVLAPPO:
         self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer_state_dict"])
         print("  Loaded optimizer")
         
-        print(f"Checkpoint loaded successfully (step {self.global_step}, episode {self.episode_count})")
+        # Print metadata if available
+        if "metadata" in checkpoint:
+            print(f"  Metadata: {checkpoint['metadata']}")
+        
+        print(f"✓ Checkpoint loaded successfully")
+        print(f"  Global step: {self.global_step}")
+        print(f"  Update count: {self.update_count}")
+        print(f"  Training stage: {self.training_stage}")
+        print(f"  Best success rate: {self.best_success_rate:.2%}")
 
 
 def main():

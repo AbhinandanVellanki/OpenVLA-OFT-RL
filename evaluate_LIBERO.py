@@ -368,7 +368,8 @@ class LiberoEvaluator:
         ]
         
         # Extract last 256 tokens (action vocabulary)
-        action_token_logits = action_logits[..., -256-64:-64]
+        # FIXED: Should be [-256:] not [-256-64:-64] to get tokens 31744-32000
+        action_token_logits = action_logits[..., -256:]
         
         # Greedy decoding (argmax)
         responses = torch.argmax(action_token_logits, dim=-1)

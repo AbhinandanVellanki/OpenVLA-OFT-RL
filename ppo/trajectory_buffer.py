@@ -32,6 +32,7 @@ class TrajectoryBuffer:
             'pixel_values': [],
             'proprio': [],
             'actions': [],  # Continuous actions (for environment)
+            'l1_actions': [],  # L1 regression actions (for BC targets)
             'rewards': [],
             'dones': [],
             'values': [],
@@ -48,6 +49,7 @@ class TrajectoryBuffer:
         pixel_values: torch.Tensor,
         proprio: Optional[np.ndarray],
         action: np.ndarray,  # Continuous action
+        l1_action: Optional[np.ndarray],  # L1 regression action (for BC)
         reward: float,
         done: bool,
         value: float,
@@ -65,6 +67,7 @@ class TrajectoryBuffer:
         self.current_trajectory['pixel_values'].append(pixel_values)
         self.current_trajectory['proprio'].append(proprio)
         self.current_trajectory['actions'].append(action)
+        self.current_trajectory['l1_actions'].append(l1_action)
         self.current_trajectory['rewards'].append(reward)
         self.current_trajectory['dones'].append(done)
         self.current_trajectory['values'].append(value)
@@ -74,14 +77,34 @@ class TrajectoryBuffer:
         
         if done:
             # Finalize trajectory and add to buffer
+            # Pad input_ids and attention_mask to max length in trajectory for stacking
+            input_ids_list = self.current_trajectory['input_ids']
+            attention_mask_list = self.current_trajectory['attention_mask']
+            
+            # Find max length
+            max_len = max(ids.shape[1] for ids in input_ids_list)
+            
+            # Pad all tensors to max length
+            padded_input_ids = []
+            padded_attention_masks = []
+            for ids, mask in zip(input_ids_list, attention_mask_list):
+                pad_len = max_len - ids.shape[1]
+                if pad_len > 0:
+                    # Pad with 0 for input_ids and 0 for attention_mask (ignore padding)
+                    ids = torch.nn.functional.pad(ids, (0, pad_len), value=0)
+                    mask = torch.nn.functional.pad(mask, (0, pad_len), value=0)
+                padded_input_ids.append(ids)
+                padded_attention_masks.append(mask)
+            
             trajectory = {
                 'observations': self.current_trajectory['observations'].copy(),
                 'responses': torch.stack(self.current_trajectory['responses']).detach(),
-                'input_ids': torch.stack(self.current_trajectory['input_ids']).detach(),
-                'attention_mask': torch.stack(self.current_trajectory['attention_mask']).detach(),
+                'input_ids': torch.stack(padded_input_ids).detach(),
+                'attention_mask': torch.stack(padded_attention_masks).detach(),
                 'pixel_values': torch.stack(self.current_trajectory['pixel_values']).detach(),
                 'proprio': np.stack(self.current_trajectory['proprio']) if self.current_trajectory['proprio'][0] is not None else None,
                 'actions': np.stack(self.current_trajectory['actions']),
+                'l1_actions': np.stack(self.current_trajectory['l1_actions']) if any(a is not None for a in self.current_trajectory['l1_actions']) else None,
                 'rewards': np.array(self.current_trajectory['rewards']),
                 'dones': np.array(self.current_trajectory['dones']),
                 'values': np.array(self.current_trajectory['values']),
@@ -102,14 +125,34 @@ class TrajectoryBuffer:
         Called at end of rollout collection if trajectory is incomplete.
         """
         if self.episode_step > 0:
+            # Pad input_ids and attention_mask to max length in trajectory for stacking
+            input_ids_list = self.current_trajectory['input_ids']
+            attention_mask_list = self.current_trajectory['attention_mask']
+            
+            # Find max length
+            max_len = max(ids.shape[1] for ids in input_ids_list)
+            
+            # Pad all tensors to max length
+            padded_input_ids = []
+            padded_attention_masks = []
+            for ids, mask in zip(input_ids_list, attention_mask_list):
+                pad_len = max_len - ids.shape[1]
+                if pad_len > 0:
+                    # Pad with 0 for input_ids and 0 for attention_mask (ignore padding)
+                    ids = torch.nn.functional.pad(ids, (0, pad_len), value=0)
+                    mask = torch.nn.functional.pad(mask, (0, pad_len), value=0)
+                padded_input_ids.append(ids)
+                padded_attention_masks.append(mask)
+            
             trajectory = {
                 'observations': self.current_trajectory['observations'].copy(),
                 'responses': torch.stack(self.current_trajectory['responses']).detach(),
-                'input_ids': torch.stack(self.current_trajectory['input_ids']).detach(),
-                'attention_mask': torch.stack(self.current_trajectory['attention_mask']).detach(),
+                'input_ids': torch.stack(padded_input_ids).detach(),
+                'attention_mask': torch.stack(padded_attention_masks).detach(),
                 'pixel_values': torch.stack(self.current_trajectory['pixel_values']).detach(),
                 'proprio': np.stack(self.current_trajectory['proprio']) if self.current_trajectory['proprio'][0] is not None else None,
                 'actions': np.stack(self.current_trajectory['actions']),
+                'l1_actions': np.stack(self.current_trajectory['l1_actions']) if any(a is not None for a in self.current_trajectory['l1_actions']) else None,
                 'rewards': np.array(self.current_trajectory['rewards']),
                 'dones': np.array(self.current_trajectory['dones']),
                 'values': np.array(self.current_trajectory['values']),
@@ -169,12 +212,14 @@ class TrajectoryBuffer:
                 returns[t] = rewards[t] + verifier_gamma * returns[t + 1]
             
             # GRPO: advantages = returns (no value baseline)
+            # For sparse binary rewards (0 or 1), use ABSOLUTE advantages
+            # This avoids negative advantages that cause policy instability
             advantages = returns.copy()
             
             traj['returns'] = returns
             traj['advantages'] = advantages
         
-        # Normalize advantages across all trajectories with robust NaN/inf handling
+        # Collect all advantages for statistics (but DON'T normalize for sparse rewards)
         all_advantages = np.concatenate([t['advantages'] for t in self.trajectories])
         
         # Check for NaN or inf in advantages
@@ -189,31 +234,28 @@ class TrajectoryBuffer:
         adv_std = all_advantages.std()
         
         # Debug: Print advantage statistics
-        print(f"\n📊 Advantage Statistics:")
+        print(f"\n📊 Advantage Statistics (ABSOLUTE - No Normalization):")
         print(f"   Mean: {adv_mean:.6f}")
         print(f"   Std: {adv_std:.6f}")
         print(f"   Min: {all_advantages.min():.6f}")
         print(f"   Max: {all_advantages.max():.6f}")
         print(f"   Total samples: {len(all_advantages)}")
         
-        # CRITICAL: If all advantages are identical (e.g., all successes), std will be 0
-        # In this case, DON'T normalize - just use raw advantages
-        if adv_std < 1e-6:
-            print(f"⚠️  WARNING: All advantages are nearly identical (std={adv_std:.2e})")
-            print(f"   Skipping normalization to prevent gradient issues.")
-            print(f"   Using raw advantages: mean={adv_mean:.6f}")
-            # Don't normalize - keep original advantages
-        else:
-            # Normal case: normalize advantages
-            adv_std = adv_std + 1e-8
-            
-            for traj in self.trajectories:
-                traj['advantages'] = (traj['advantages'] - adv_mean) / adv_std
-                
-                # Final safety check after normalization
-                if np.any(np.isnan(traj['advantages'])) or np.any(np.isinf(traj['advantages'])):
-                    print(f"⚠️  ERROR: NaN/inf in advantages after normalization! Setting to zeros.")
-                    traj['advantages'] = np.nan_to_num(traj['advantages'], nan=0.0, posinf=0.0, neginf=0.0)
+        # CRITICAL: For sparse binary rewards (0 or 1), DO NOT normalize!
+        # Normalization creates negative advantages which confuse the policy.
+        # Instead, use absolute advantages:
+        #   - Successful trajectories: advantage = 1.0 (increase log prob)
+        #   - Failed trajectories: advantage = 0.0 (no gradient)
+        print(f"\n✓ Using ABSOLUTE advantages (no normalization) for sparse rewards")
+        print(f"  - Successful steps: advantage ≈ {all_advantages.max():.2f}")
+        print(f"  - Failed steps: advantage ≈ {all_advantages.min():.2f}")
+        print(f"  - This ensures policy only increases prob of successful actions\n")
+        
+        # Final safety check
+        for traj in self.trajectories:
+            if np.any(np.isnan(traj['advantages'])) or np.any(np.isinf(traj['advantages'])):
+                print(f"⚠️  ERROR: NaN/inf in advantages! Setting to zeros.")
+                traj['advantages'] = np.nan_to_num(traj['advantages'], nan=0.0, posinf=0.0, neginf=0.0)
     
     def get(self) -> Dict[str, Any]:
         """
@@ -248,6 +290,7 @@ class TrajectoryBuffer:
             'pixel_values': torch.cat([traj['pixel_values'] for traj in self.trajectories]),
             'proprio': np.concatenate([traj['proprio'] for traj in self.trajectories if traj['proprio'] is not None]) if self.trajectories[0]['proprio'] is not None else None,
             'actions': np.concatenate([traj['actions'] for traj in self.trajectories]),
+            'l1_actions': np.concatenate([traj['l1_actions'] for traj in self.trajectories if traj['l1_actions'] is not None]) if any(traj['l1_actions'] is not None for traj in self.trajectories) else None,
             'rewards': np.concatenate([traj['rewards'] for traj in self.trajectories]),
             'returns': np.concatenate([traj['returns'] for traj in self.trajectories]),
             'advantages': np.concatenate([traj['advantages'] for traj in self.trajectories]),

@@ -2,7 +2,7 @@
 # Start PPO training with full cleanup and detachment
 # Handles CUDA memory cleanup and survives SSH disconnects
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0,1
 
 echo "========================================="
 echo "PPO Training Launcher"
@@ -39,6 +39,9 @@ echo "========================================="
 
 # Start training completely detached
 nohup bash -c '
+    # CRITICAL: Set CUDA_VISIBLE_DEVICES in the nohup shell
+    export CUDA_VISIBLE_DEVICES=0,1
+    
     # Activate conda
     source ~/miniconda3/etc/profile.d/conda.sh
     conda activate oft_rl
@@ -51,6 +54,7 @@ nohup bash -c '
         --task-suite libero_spatial \
         --task-id 0 \
         --timesteps 10000000 \
+        --use-data-parallel \
 ' > ppo_training.log 2>&1 &
 
 # Get the PID
@@ -70,7 +74,7 @@ echo "Configuration:"
 echo "  - Task: libero_spatial, task_id=0"
 echo "  - Total timesteps: 10,000,000"
 echo "  - Action chunking: 8 actions/query"
-echo "  - GPU config: Read from vla_oft/min_vla/config.py"
+echo "  - Multi-GPU: DataParallel on GPUs 0,1"
 echo "  - Wandb: enabled"
 echo ""
 echo "Monitor with:"

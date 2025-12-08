@@ -37,17 +37,10 @@ class OpenVLAActor:
     def __init__(self, cfg: OpenVLAActorConfig) -> None:
         self.cfg = cfg
         self.device = torch.device(cfg.device)  # Main device for VLA
-        self.action_head_device = torch.device(cfg.action_head_device)
-        self.proprio_device = torch.device(cfg.proprio_projector_device)
 
-        if cfg.use_multi_gpu:
-            print(f"🔧 Multi-GPU Setup:")
-            print(f"   VLA Model → {cfg.device} (requires ~14GB)")
-            print(f"   Action Head → {cfg.action_head_device} (requires ~134MB)")
-            print(f"   Proprio Projector → {cfg.proprio_projector_device} (requires ~66MB)")
-        else:
-            print(f"🔧 Single-GPU Setup:")
-            print(f"   All components on {cfg.device} (requires ~14.2GB total)")
+        print(f"🔧 Device Setup: {cfg.device}")
+        if cfg.use_data_parallel and torch.cuda.device_count() > 1:
+            print(f"   DataParallel will use {torch.cuda.device_count()} GPUs")
 
         # 1) Load VLA model from HF (this pulls modeling_prismatic, etc.)
         self.vla = openvla_utils.get_vla(cfg) # return vla model in eval mode
@@ -62,14 +55,8 @@ class OpenVLAActor:
             # Use proprio_dim from config (default 8 for LIBERO)
             proprio_dim = cfg.proprio_dim
             self.proprio_projector = openvla_utils.get_proprio_projector(
-                cfg, llm_dim=llm_dim, proprio_dim=proprio_dim, device=self.proprio_device, vla=self.vla
+                cfg, llm_dim=llm_dim, proprio_dim=proprio_dim, device=self.device, vla=self.vla
             )
-            # ENFORCE: Move to correct device if VLA model loaded it elsewhere
-            if hasattr(self.vla, 'proprio_projector') and self.vla.proprio_projector is not None:
-                current_device = next(self.vla.proprio_projector.parameters()).device
-                if current_device != self.proprio_device:
-                    print(f"⚠️  Moving VLA's proprio_projector from {current_device} to {self.proprio_device}")
-                    self.vla.proprio_projector = self.vla.proprio_projector.to(self.proprio_device)
         
         # Store config for later use
         self.cfg = cfg
@@ -78,14 +65,7 @@ class OpenVLAActor:
         self.l1_action_head = None
         if cfg.load_l1_action_head and not cfg.finetuned_on_discrete_actions:
             llm_dim = self.vla.llm_dim
-            self.l1_action_head = openvla_utils.get_action_head(cfg, llm_dim=llm_dim, device=self.action_head_device, vla=self.vla)
-            
-            # ENFORCE: Move to correct device if VLA model loaded it elsewhere
-            if hasattr(self.vla, 'action_head') and self.vla.action_head is not None:
-                current_device = next(self.vla.action_head.parameters()).device
-                if current_device != self.action_head_device:
-                    print(f"⚠️  Moving VLA's action_head from {current_device} to {self.action_head_device}")
-                    self.vla.action_head = self.vla.action_head.to(self.action_head_device)
+            self.l1_action_head = openvla_utils.get_action_head(cfg, llm_dim=llm_dim, device=self.device, vla=self.vla)
             
             if cfg.freeze_l1_action_head:
                 for param in self.l1_action_head.parameters():

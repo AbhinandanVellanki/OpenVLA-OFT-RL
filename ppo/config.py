@@ -37,12 +37,29 @@ class PPOConfig:
     
     batch_size: int = 2
     """Minibatch size for SGD updates during policy optimization.
-    With n_steps=128, batch_size=2 provides maximum memory efficiency while maintaining some gradient stability.
-    - Larger batches (4-8): More stable gradients, higher memory
-    - Smaller batches (1-2): Lower memory, more noise
-    Must divide evenly into n_steps for best results.
     
-    Using batch_size=2 to avoid OOM with 7B LoRA model during backward pass.
+    CRITICAL: DataParallel REPLICATES the model on each GPU (doesn't split it).
+    Only the batch is split across GPUs.
+    
+    Memory usage per GPU with DataParallel:
+    - Model replica: ~18-20GB (FULL model on EACH GPU)
+    - Batch forward: Split (batch_size/2 samples per GPU)
+    - Gradients: ~2-3GB (synchronized across GPUs)
+    - Gradient checkpointing overhead: Extra activations stored
+    
+    batch_size=2 (current, SAFEST):
+    - Each GPU: Model (18GB) + 1 sample (~1GB) + gradients (2GB) = ~21GB ✓
+    - Safe for 24GB GPUs with memory fragmentation
+    - Minimal parallelism but stable
+    - 512/2 = 256 minibatches/epoch
+    
+    batch_size=4 (CAUSES OOM):
+    - Each GPU: Model (18GB) + 2 samples (~1.5GB) + gradients (2GB) = ~21.5GB
+    - With fragmentation and checkpointing overhead → OOM ✗
+    
+    Note: DataParallel doesn't provide significant speedup with batch_size=2
+    since each GPU only processes 1 sample. Consider disabling DataParallel
+    if memory is tight, or switching to pipeline parallelism.
     """
     
     n_epochs: int = 10
@@ -57,14 +74,20 @@ class PPOConfig:
     # PPO Algorithm Hyperparameters
     # ===========================================
     
-    actor_lr: float = 1e-6
+    actor_lr: float = 5e-7
     """Learning rate for the actor (VLA policy network).
     Lower than standard RL due to fine-tuning a pretrained 7B model.
-    - 5e-7: Ultra-conservative, prevents gradient explosions even with mean log probs
-    - 1e-6: Very conservative, prevents massive gradient explosions with 7B LoRA
-    - 5e-6: Conservative, prevents NaN losses
-    - 1e-5: Moderate, prevents catastrophic forgetting
+    - 3e-7: Ultra-conservative, for very stable training
+    - 5e-7: Very conservative, good balance of stability and learning speed ✓
+    - 1e-6: Conservative, but can cause high clip fractions with large advantages
+    - 5e-6: Too aggressive for 7B LoRA fine-tuning
+    - 1e-5: Moderate, risk of catastrophic forgetting
     - 1e-4 to 3e-4: Standard RL, use only if training from scratch
+    
+    Reduced from 1e-6 to 5e-7 based on training analysis:
+    - With 1e-6: clip fraction 0.8-0.99 (too aggressive)
+    - Target: clip fraction 0.2-0.4 (stable learning)
+    
     Adam optimizer is used for both actor and critic.
     """
     
@@ -134,6 +157,29 @@ class PPOConfig:
     - 0.99: Light discounting if needed
     """
     
+    advantage_scale: float = 0.5
+    """Scaling factor for advantages to control gradient magnitude.
+    
+    With sparse binary rewards (0 or 1), successful trajectories get advantage=1.0.
+    This can cause large gradients and high clip fractions. Scaling reduces this:
+    
+    - 1.0: No scaling (default GRPO, but can cause clip fraction >0.9)
+    - 0.5: Half-scale advantages (reduces aggressive updates) ✓
+    - 0.3: Strong scaling (very conservative)
+    - 0.1: Extreme scaling (too slow learning)
+    
+    Formula: scaled_advantage = advantage * advantage_scale
+    
+    Effect on training:
+    - advantage_scale=1.0 → clip fraction 0.8-0.99 (unstable)
+    - advantage_scale=0.5 → clip fraction 0.3-0.5 (target range)
+    
+    This is especially important when:
+    - Success rate is high (80-100%) → most advantages are 1.0
+    - Learning rate is conservative (5e-7) but gradients still large
+    - Clip fraction consistently >0.7
+    """
+    
     entropy_coef: float = 0.01
     """Coefficient for entropy bonus in the loss function.
     Encourages exploration by penalizing overly deterministic policies.
@@ -141,6 +187,48 @@ class PPOConfig:
     - 0.01: Standard value for continuous control
     - 0.001-0.1: Typical range
     Note: Currently not used since VLA is deterministic, but kept for future stochastic versions.
+    """
+    
+    # === L1 Warmstart Configuration ===
+    use_l1_warmstart: bool = True
+    """Enable L1 warmstart before transitioning to tokenized RL.
+    When enabled, training proceeds in phases:
+    1. Warmup (0-l1_warmup_steps): Execute L1 actions, train tokenized to match (behavior cloning)
+    2. Transition (warmup_steps to warmup_steps+transition_steps): Gradually shift to tokenized
+    3. RL (after transition): Execute tokenized actions, train with true PPO
+    
+    This prevents the tokenized head from learning poorly initially and enables
+    true reinforcement learning once the tokenized policy is competent.
+    """
+    
+    l1_warmup_steps: int = 25000
+    """Number of steps to use L1 actions for rollouts (behavior cloning phase).
+    During warmup:
+    - L1 head generates high-quality actions (frozen)
+    - Environment executes L1 actions
+    - Tokenized head is trained to match L1 (supervised learning)
+    - Expected tokenized success rate: 0% → 40%
+    
+    Recommended values:
+    - 25000: Standard warmup (25k steps ≈ 500-1000 episodes)
+    - 50000: Extended warmup for complex tasks
+    - 0: Skip warmup (not recommended, tokenized starts from scratch)
+    """
+    
+    l1_transition_steps: int = 10000
+    """Number of steps for gradual transition from L1 to tokenized actions.
+    Uses epsilon-greedy policy:
+    - Start of transition: 100% L1, 0% tokenized
+    - Middle: 50% L1, 50% tokenized
+    - End: 0% L1, 100% tokenized
+    
+    This prevents catastrophic forgetting and ensures smooth handoff.
+    Expected tokenized success rate during transition: 40% → 50%
+    
+    Recommended values:
+    - 5000: Standard transition
+    - 10000: Slower transition for stability
+    - 0: Immediate switch (may cause performance drop)
     """
     
     value_loss_coef: float = 0.5
@@ -215,7 +303,7 @@ class PPOConfig:
     # Validation
     # ===========================================
     
-    val_interval: int = 1000
+    val_interval: int = 1024
     """Run validation every N environment steps (not updates).
     Validation runs val_episodes full episodes to measure success rate.
     - 1000-5000: Frequent validation, useful for debugging
@@ -247,13 +335,6 @@ class PPOConfig:
     - 'username': Logs to personal account
     - 'team-name': Logs to team workspace
     Set this if you want to log to a specific entity.
-    """
-    
-    log_interval: int = 100
-    """Print training stats every N environment steps.
-    Lower values give more frequent updates but clutter the console.
-    - 100-1000: Frequent logging
-    - 5000-10000: Less frequent, cleaner output
     """
     
     save_interval: int = 10000

@@ -1062,41 +1062,46 @@ class OpenVLAPPO:
                 for i, idx in enumerate(mb_indices):
                     obs = data["observations"][idx.item()]
                     l1_actions_chunk = l1_actions[idx.item()]  # Full chunk (8, 7)
-                    
+
                     # Convert L1 actions chunk to target token IDs
                     # Flatten to (56,) then discretize
                     l1_actions_flat = l1_actions_chunk.flatten()  # (8, 7) -> (56,)
                     target_tokens = self._discretize_l1_actions(l1_actions_flat).to(self.training_device)
-                    
+
                     # Get action token logits from current policy (generates full chunk)
                     action_data = self.predict_action_tokens_with_grad(
                         obs, task_prompt, temperature=1.0, sample=False
                     )
-                    
+
                     # Extract logits for the 256 action tokens
                     # logits shape: (1, 56, 256) for 8 actions × 7 dims
                     logits_full = action_data['logits'][0]  # (56, 256)
                     logits_full = logits_full.to(self.training_device)
-                    
+
+                    # Compute entropy from stochastic policy logits (BC phase)
+                    action_probs = torch.softmax(logits_full, dim=-1)
+                    entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(dim=-1).mean()
+                    stats['train/bc_entropy'].append(entropy.item())
+
                     # Map target tokens to indices in [0, 255]
                     target_indices = target_tokens - (self.action_tokenizer.vocab_size - 256)
                     target_indices = target_indices.clamp(0, 255)  # Safety clamp
-                    
+
                     # Cross-entropy loss: train all 8 actions at once
                     # logits: (56, 256), targets: (56,)
                     bc_loss = nn.functional.cross_entropy(logits_full, target_indices, reduction='mean')
-                    
+
                     # Normalize by batch size for gradient accumulation
                     (bc_loss / len(mb_indices)).backward()
-                    
+
                     # Compute accuracy (percentage of correctly predicted bins across all 8 actions)
                     with torch.no_grad():
                         pred_indices = logits_full.argmax(dim=-1)
                         accuracy = (pred_indices == target_indices).float().mean()
                         total_accuracy += accuracy.item()
-                    
+
                     total_bc_loss += bc_loss.item()
-                    
+
                     # Clear intermediate data
                     del action_data
                 
@@ -1153,9 +1158,11 @@ class OpenVLAPPO:
             epoch_accuracy = np.mean([s for s in stats['train/bc_accuracy'][-num_minibatches:]])
             
             # Print epoch summary
+            epoch_entropy = np.mean([s for s in stats['train/bc_entropy'][-num_minibatches:]]) if 'train/bc_entropy' in stats and stats['train/bc_entropy'] else float('nan')
             print(f"\n  Epoch {epoch+1}/{self.cfg.n_epochs} → "
-                  f"BC Loss: {epoch_bc_loss:.6f} | "
-                  f"Accuracy: {epoch_accuracy:.4f}")
+                f"BC Loss: {epoch_bc_loss:.6f} | "
+                f"Accuracy: {epoch_accuracy:.4f} | "
+                f"Entropy: {epoch_entropy:.4f}")
             
             # Update epoch progress bar
             epoch_pbar.set_postfix({
@@ -1169,11 +1176,13 @@ class OpenVLAPPO:
         aggregated_stats = {
             'train/bc_loss': np.mean(stats['train/bc_loss']),
             'train/bc_accuracy': np.mean(stats['train/bc_accuracy']),
+            'train/bc_entropy': np.mean(stats['train/bc_entropy']) if stats['train/bc_entropy'] else float('nan'),
         }
         
         print(f"\n✓ BC update complete:")
         print(f"   Loss: {aggregated_stats['train/bc_loss']:.6f}")
         print(f"   Accuracy: {aggregated_stats['train/bc_accuracy']:.4f}")
+        print(f"   BC Entropy: {aggregated_stats['train/bc_entropy']:.4f}")
         print(f"{'='*70}\n")
         
         # Clear trajectory buffer after update
@@ -1668,6 +1677,8 @@ class OpenVLAPPO:
                     # H = -sum(p * log(p)) where p = softmax(logits)
                     action_probs = torch.softmax(logits, dim=-1)  # (seq_len, 256)
                     entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(dim=-1).mean()  # Mean over sequence
+                    # Log entropy for PPO/transition phase
+                    stats['train/ppo_entropy'].append(entropy.item())
                     
                     # Check for NaN in computed log_prob
                     if torch.isnan(log_prob).any() or torch.isinf(log_prob).any():

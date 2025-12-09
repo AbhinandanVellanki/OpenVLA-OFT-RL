@@ -303,7 +303,7 @@ class PPOConfig:
     # Logging and Checkpointing
     # ===========================================
     
-    checkpoint_dir: str = "checkpoints"
+    checkpoint_dir: str = "/home/abhi/Documents/Deep-RL/OpenVLA-OFT-RL/checkpoints"
     """Directory to save model checkpoints.
     
     Checkpoints include:
